@@ -1,9 +1,21 @@
-**MIT License**
+**Frzok/Shadow-Squad-Bot-Discord** is licensed under the **MIT License**.
 
-Copyright (c) 2024 Frzok
+### Overview of the MIT License
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+The MIT License is a permissive open-source license that is simple and easy to understand. It allows for a great deal of freedom, but with minimal requirements.
 
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+### Key Permissions Granted by the MIT License:
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+- **Commercial Use**: You can use the project for commercial purposes.
+- **Modification**: You are free to modify the software in any way you like.
+- **Distribution**: You can distribute copies of the original software or your modified versions.
+- **Private Use**: The software can be used privately without any public disclosure.
+
+### Key Limitations:
+
+- **Liability**: The license includes a disclaimer of warranties, meaning the software is provided "as-is" without any guarantees, and the authors are not liable for any issues that arise from using the software.
+- **Warranty**: There is no warranty for the software, so the authors are not responsible for fixing any issues or providing support.
+
+### Conditions:
+
+- The primary condition of the MIT License is that the original copyright notice and license text must be included in all copies or substantial portions of the software. This ensures that credit is given to the original authors.
