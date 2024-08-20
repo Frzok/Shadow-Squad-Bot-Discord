@@ -1,25 +1,25 @@
 # config.py
 
 # Discord Bot Configuration
-DISCORD_BOT_TOKEN = "MTI2OTY3ODkyNTE1MjUyMjMwMA.G_AXKA.Swk1yBcCReqKHrCfAEoqi9KrUII6eDrV33OIbU"  # Замените на ваш токен
+DISCORD_BOT_TOKEN = "your_discord_bot_token_here"  # Замените на ваш токен
 
 # IDs
-GUILD_ID = 604571954422218752  # ID сервера
-GUEST_ROLE_ID = 809395293002137620  # ID роли "Гость"
-TEMP_CHANNEL_CATEGORY_ID = 604571954422218754  # ID категории для временных каналов
-TARGET_CHANNEL_IDS = [1269731028092588167, 1273720411045232721, 1273694401188724869]  # ID каналов, где создаются временные каналы
+GUILD_ID = "your_guild_id_here"  # ID сервера
+GUEST_ROLE_ID = "your_guest_role_id_here"  # ID роли "Гость"
+TEMP_CHANNEL_CATEGORY_ID = "your_temp_channel_category_id_here"  # ID категории для временных каналов
+TARGET_CHANNEL_IDS = ["your_target_channel_id_1_here", "your_target_channel_id_2_here", "your_target_channel_id_3_here"]  # ID каналов, где создаются временные каналы
 MAX_CHANNELS_PER_USER = 1  # Максимальное количество каналов, которые может создать пользователь
 MAX_USERS_PER_TEMP_CHANNEL = 10  # Максимальное количество пользователей в одном временном канале
-CHANNEL_ID = 809402292284686346  # ID канала для отправки еженедельных сообщений
-ROLE_ID = 604574109485105194  # ID роли, которую нужно упомянуть в еженедельном сообщении
-USER_ID = 197371266007564289  # ID пользователя для упоминания в еженедельном сообщении
-USER_ID_TO_DELETE = 1187013846746005515  # ID пользователя, сообщения которого нужно удалять
+CHANNEL_ID = "your_channel_id_here"  # ID канала для отправки еженедельных сообщений
+ROLE_ID = "your_role_id_here"  # ID роли, которую нужно упомянуть в еженедельном сообщении
+USER_ID = "your_user_id_here"  # ID пользователя для упоминания в еженедельном сообщении
+USER_ID_TO_DELETE = "user_id_to_delete_here"  # ID пользователя, сообщения которого нужно удалять
 
 # Role IDs for the "pidor_of_the_day" command
 ROLE_IDS = {
-    "SERGEANT": 604574109485105194,  # ID роли сержанта
-    "OCHKO": 943631720916340756,     # ID роли очко
-    "RL": 604574054938181643         # ID роли РЛ
+    "SERGEANT": "your_sergeant_role_id_here",  # ID роли сержанта
+    "OCHKO": "your_ochko_role_id_here",     # ID роли очко
+    "RL": "your_rl_role_id_here"         # ID роли РЛ
 }
 
 # Durations
