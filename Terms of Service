@@ -1,39 +1,126 @@
-# Terms of Service
+# Условия использования Shadow Squad Discord Bot
 
-## 1. Acceptance of Terms
+Дата вступления в силу: 24 июля 2026 года
 
-By using the Shadow-Squad-Bot-Discord (the "Bot"), you agree to be bound by these Terms of Service ("Terms"). If you do not agree with any of these terms, you are prohibited from using or accessing the Bot.
+Последнее обновление: 24 июля 2026 года
 
-## 2. Description of the Bot
+## 1. Принятие условий
 
-The Bot is a Discord application for the Shadow Squad guild. Its features include Discord role synchronization with Blizzard guild data, temporary voice channels, guest-role timers, raid announcements and attendance, character links, WoW Audit loot history, backups, and guild statistics.
+Используя Shadow Squad Discord Bot («Бот») на сервере Shadow Squad, вы
+соглашаетесь с настоящими Условиями и Политикой конфиденциальности. Если вы не
+согласны, прекратите использование команд Бота и обратитесь к оператору по
+поводу удаления относящихся к вам данных.
 
-## 3. User Responsibilities
+Бот предназначен только для участников Discord-сервера Shadow Squad. Вы также
+обязаны соблюдать [Discord Terms of Service](https://discord.com/terms),
+[Discord Community Guidelines](https://discord.com/guidelines) и правила
+сервера.
 
-- **Compliance with Discord's Terms of Service**: You must comply with Discord's [Terms of Service](https://discord.com/terms) while using the Bot.
-- **Proper Use**: You agree not to misuse the Bot, including but not limited to, using it for spamming, harassment, or any other unlawful activities.
-- **Respect for Privacy**: You are responsible for ensuring that any data you collect or manage through the Bot is handled in compliance with applicable privacy laws.
+## 2. Оператор и поддержка
 
-## 4. Privacy and Data Collection
+Бот является частным некоммерческим проектом гильдии. Оператор — Frzok.
+Вопросы, жалобы, сообщения о нарушениях и запросы по данным направляйте:
 
-The Bot stores data needed for its functionality, including Discord user IDs, relevant absence-channel messages, role history, World of Warcraft character links, attendance, timers, and server-specific settings. The Bot relies on Discord and Blizzard services. For details about storage, retention, and user rights, please refer to our Privacy Policy.
+- в Discord: `@frzok` (`197371266007564289`);
+- по электронной почте: `morksid.m@gmail.com`.
 
-## 5. Modifications to the Bot and Terms
+## 3. Возможности Бота
 
-We reserve the right to modify or discontinue the Bot at any time without notice. Additionally, we may revise these Terms at any time. By continuing to use the Bot, you agree to be bound by the current version of these Terms.
+Бот может:
 
-## 6. Termination
+- синхронизировать Discord-роли с рангами и специализациями персонажей
+  World of Warcraft;
+- управлять гостевыми ролями и временными голосовыми комнатами;
+- хранить привязки персонажей, историю ролей и состояние запланированных задач;
+- учитывать посещаемость РТ, предупреждения об отсутствии и опоздания;
+- публиковать рейдовые объявления, напоминания о тактиках и отчёты по луту;
+- показывать служебный статус, статистику и развлекательные результаты;
+- создавать и восстанавливать резервные копии локальной базы.
 
-We reserve the right to terminate or suspend access to the Bot for any user who violates these Terms or engages in harmful behavior towards other users or the Bot itself.
+Конкретный набор команд и права доступа определяются ролями Discord и могут
+изменяться оператором.
 
-## 7. Limitation of Liability
+## 4. Правила допустимого использования
 
-The Bot is provided "as is" without any warranties of any kind. In no event shall the developers or owners of the Bot be liable for any damages arising out of the use or inability to use the Bot.
+Запрещается:
 
-## 8. Governing Law
+- использовать Бота для нарушения закона, правил Discord или правил сервера;
+- пытаться получить доступ к закрытым командам, базе, резервным копиям,
+  токенам или чужим данным;
+- вмешиваться в работу Бота, обходить ограничения частоты, спамить командами
+  или намеренно создавать чрезмерную нагрузку;
+- использовать результаты Бота для травли, угроз, дискриминации или выдавать
+  развлекательные результаты за фактические утверждения о человеке;
+- вводить в привязки заведомо чужих персонажей или ложные данные;
+- копировать или распространять данные других участников без законного
+  основания и необходимых разрешений.
 
-These Terms are governed by and construed in accordance with the laws of Germany, and you irrevocably submit to the exclusive jurisdiction of the courts in that country.
+Команды с юмористическими формулировками являются игровой механикой сервера и
+не должны использоваться для оскорблений или преследования.
 
-## 9. Contact Information
+## 5. Автоматические действия и данные третьих сторон
 
-If you have any questions about these Terms, please contact us at morksid.m@gmail.com.
+Роли, посещаемость и отчёты могут изменяться автоматически на основании данных
+Discord, Blizzard и WoW Audit. Такие данные могут быть задержаны, неполны или
+ошибочны. Пользователь обязан сообщить оператору, если автоматическое решение
+требует исправления.
+
+Бот не запрашивает пароль Battle.net или Discord. Никому не передавайте свои
+пароли и токены под видом привязки персонажа.
+
+В предупреждениях об отсутствии или опоздании не указывайте диагнозы,
+финансовые, семейные и другие чувствительные подробности: для функции Бота они
+не нужны.
+
+## 6. Сторонние сервисы
+
+Работа Бота зависит от Discord, Blizzard, WoW Audit и, для ссылки на состав,
+Google Sheets. Использование этих сервисов регулируется их собственными
+условиями и политиками. Их доступность и точность не контролируются оператором.
+
+Названия Discord, Blizzard, Battle.net, World of Warcraft, WoW Audit и Google,
+а также связанные товарные знаки принадлежат их владельцам. Бот не является
+официальным продуктом этих компаний и не заявляет об их партнёрстве,
+спонсорстве или одобрении.
+
+## 7. Конфиденциальность
+
+Состав обрабатываемых данных, цели, сроки хранения, получатели и порядок
+запроса удаления описаны в Политике конфиденциальности проекта. Использование
+Бота не отменяет прав пользователя, предоставленных применимым
+законодательством.
+
+## 8. Доступность, изменения и прекращение работы
+
+Бот предоставляется «как есть» и «по мере доступности». Оператор может
+исправлять, изменять, ограничивать или прекращать функции Бота, в том числе
+для безопасности, обслуживания или соблюдения правил платформ.
+
+Доступ пользователя может быть ограничен при нарушении настоящих Условий,
+правил Discord или правил сервера. При прекращении работы Бота данные
+обрабатываются в порядке, указанном в Политике конфиденциальности.
+
+## 9. Отказ от гарантий и ограничение ответственности
+
+В пределах, допускаемых применимым законодательством, оператор не гарантирует
+бесперебойную работу, отсутствие ошибок, сохранность каждого сообщения или
+точность данных сторонних API. Оператор не отвечает за косвенные убытки,
+потерю данных, игровой прогресс, распределение лута или решения администрации
+гильдии, принятые исключительно на основании ошибочных данных Бота.
+
+Ничто в этих Условиях не ограничивает ответственность или права, которые
+нельзя исключить по применимому законодательству.
+
+## 10. Применимое право
+
+Применяется право, которое обязательно распространяется на отношения между
+оператором и конкретным пользователем. Императивные права потребителя по месту
+его проживания сохраняются. Споры следует сначала попытаться решить через
+контакты оператора.
+
+## 11. Изменения условий
+
+Условия могут обновляться при изменении Бота, правил платформ или
+законодательства. Дата обновления указывается в начале документа. Продолжение
+использования после уведомления об изменениях означает принятие новой версии
+в той мере, в которой это допускается законом.

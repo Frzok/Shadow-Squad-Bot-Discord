@@ -5,6 +5,8 @@
 сервере с неверными ролями.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -24,6 +26,20 @@ def _int_env(name: str, default: int = 0) -> int:
 def _blizzard_slug_env(name: str) -> str:
     value = os.getenv(name, "").strip().casefold()
     return re.sub(r"[\s_]+", "-", value)
+
+
+def _int_set_env(name: str) -> set[int]:
+    value = os.getenv(name, "")
+    try:
+        return {
+            int(item)
+            for item in re.split(r"[\s,;]+", value.strip())
+            if item
+        }
+    except ValueError as error:
+        raise RuntimeError(
+            f"{name} должен содержать Discord ID через запятую"
+        ) from error
 
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
@@ -90,6 +106,7 @@ REMINDER_ROLE_ID = _int_env("REMINDER_ROLE_ID")
 REMINDER_USER_ID = _int_env("REMINDER_USER_ID")
 FRZOK_USER_ID = _int_env("FRZOK_USER_ID", 197371266007564289)
 PIDOR_CHANNEL_ID = _int_env("PIDOR_CHANNEL_ID", 810474409755541524)
+PIDOR_EXCLUDED_USER_IDS = _int_set_env("PIDOR_EXCLUDED_USER_IDS")
 
 # Blizzard Battle.net API.
 BLIZZARD_CLIENT_ID = os.getenv("BLIZZARD_CLIENT_ID", "")
@@ -141,7 +158,11 @@ MESSAGES = {
         "<@197371266007564289>.\n\n"
         "Все обращения по поводу изменения ролей, привязок персонажей "
         "или других данных также необходимо направлять "
-        "<@197371266007564289>."
+        "<@197371266007564289>.\n\n"
+        "Как Бот обрабатывает данные: "
+        "[Политика конфиденциальности]"
+        "(https://github.com/Frzok/Shadow-Squad-Bot-Discord/blob/main/"
+        "Privacy%20Policy)."
     ),
     "WELCOME_MESSAGE": (
         "# ⚔️ Тебе присвоена роль «Сержант»!\n\n"
@@ -173,7 +194,11 @@ MESSAGES = {
         "[🙀крутилочная]"
         "(https://discord.com/channels/604571954422218752/1279440882679939133).\n\n"
         "Все обращения по поводу изменения ролей, привязок персонажей "
-        "или других данных необходимо направлять <@197371266007564289>."
+        "или других данных необходимо направлять <@197371266007564289>.\n\n"
+        "Как Бот обрабатывает данные: "
+        "[Политика конфиденциальности]"
+        "(https://github.com/Frzok/Shadow-Squad-Bot-Discord/blob/main/"
+        "Privacy%20Policy)."
     ),
     "NO_CANDIDATES": "Не нашёл подходящих кандидатов для выбора.",
     "PIDORS_OF_THE_WEEK": "Итак, статистика этой недели:\n",

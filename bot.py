@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import random
 import re
@@ -8,6 +9,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -17,6 +19,15 @@ import config
 from blizzard import BlizzardAPIError, BlizzardClient, GuildCharacter
 from storage import StateStore
 from wowaudit import LootHistoryItem, WoWAuditAPIError, WoWAuditClient
+
+
+if not hasattr(asyncio, "to_thread"):
+    async def _to_thread(function, /, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        call = functools.partial(function, *args, **kwargs)
+        return await loop.run_in_executor(None, call)
+
+    asyncio.to_thread = _to_thread
 
 
 logging.basicConfig(
@@ -54,7 +65,7 @@ attendance_lock = asyncio.Lock()
 wowaudit_fetch_lock = asyncio.Lock()
 last_roster_request_monotonic = 0.0
 last_wowaudit_fetch_at = 0.0
-wowaudit_loot_cache: tuple[str, list[LootHistoryItem]] | None = None
+wowaudit_loot_cache: Optional[tuple[str, list[LootHistoryItem]]] = None
 specialization_role_cache: dict[int, str] = {}
 suppressed_role_events: dict[tuple[int, int, str], float] = {}
 PROCESS_STARTED_AT = datetime.now(MSK)
@@ -145,7 +156,7 @@ def parse_state_int(key: str) -> int:
         return 0
 
 
-def format_msk_timestamp(value: str | None) -> str:
+def format_msk_timestamp(value: Optional[str]) -> str:
     if not value:
         return "нет"
     try:
@@ -155,7 +166,7 @@ def format_msk_timestamp(value: str | None) -> str:
         return value
 
 
-def next_role_sync_time(now: datetime | None = None) -> datetime:
+def next_role_sync_time(now: Optional[datetime] = None) -> datetime:
     current = now or datetime.now(MSK)
     for hour in (8, 13, 19):
         candidate = current.replace(hour=hour, minute=0, second=0, microsecond=0)
@@ -166,7 +177,7 @@ def next_role_sync_time(now: datetime | None = None) -> datetime:
     )
 
 
-def next_weekly_reset_time(now: datetime | None = None) -> datetime:
+def next_weekly_reset_time(now: Optional[datetime] = None) -> datetime:
     current = now or datetime.now(MSK)
     days_ahead = (2 - current.weekday()) % 7
     candidate = (current + timedelta(days=days_ahead)).replace(
@@ -187,7 +198,7 @@ def parse_raid_date(value: str) -> datetime:
     raise ValueError("Используйте дату в формате ДД.ММ.ГГГГ")
 
 
-def next_main_raid_date(now: datetime | None = None) -> datetime:
+def next_main_raid_date(now: Optional[datetime] = None) -> datetime:
     current = now or datetime.now(MSK)
     if current.weekday() in (4, 6):
         return current.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -362,8 +373,8 @@ def eligible_raid_members(guild: discord.Guild) -> set[discord.Member]:
 
 async def start_raid_attendance(
     guild: discord.Guild,
-    raid_date: str | None = None,
-    started_at: float | None = None,
+    raid_date: Optional[str] = None,
+    started_at: Optional[float] = None,
 ) -> tuple[int, bool]:
     async with attendance_lock:
         active = store.active_raid_session()
@@ -382,8 +393,8 @@ async def start_raid_attendance(
 
 async def finish_raid_attendance(
     guild: discord.Guild,
-    ended_at: float | None = None,
-) -> tuple[int | None, dict[str, int]]:
+    ended_at: Optional[float] = None,
+) -> tuple[Optional[int], dict[str, int]]:
     async with attendance_lock:
         session = store.active_raid_session()
         if not session:
@@ -606,7 +617,7 @@ def format_loot_timestamp(value: str) -> str:
         return value
 
 
-def parse_loot_timestamp(value: str) -> float | None:
+def parse_loot_timestamp(value: str) -> Optional[float]:
     if not value:
         return None
     try:
@@ -635,7 +646,7 @@ def loot_history_line(item: LootHistoryItem) -> str:
     )
 
 
-def cached_guild_roster() -> tuple[list[GuildCharacter], float | None]:
+def cached_guild_roster() -> tuple[list[GuildCharacter], Optional[float]]:
     rows, fetched_at = store.load_roster()
     return (
         [
@@ -728,7 +739,7 @@ def member_character_candidates(member: discord.Member) -> set[str]:
     return candidates
 
 
-def configured_link_owner(character_name: str) -> int | None:
+def configured_link_owner(character_name: str) -> Optional[int]:
     normalized = normalize_character_name(character_name)
     for member_id, names in config.DISCORD_CHARACTER_LINKS.items():
         if any(normalize_character_name(name) == normalized for name in names):
@@ -738,7 +749,7 @@ def configured_link_owner(character_name: str) -> int | None:
 
 def highest_guild_character(
     member: discord.Member, roster: list[GuildCharacter]
-) -> GuildCharacter | None:
+) -> Optional[GuildCharacter]:
     names = member_character_candidates(member)
     matches = [
         character.rank
@@ -800,7 +811,7 @@ async def member_healer_status(
     member: discord.Member,
     roster: list[GuildCharacter],
     report: list[str],
-) -> bool | None:
+) -> Optional[bool]:
     candidates = member_character_candidates(member)
     characters = [
         character
@@ -869,7 +880,7 @@ async def add_roles_automatically(
     member: discord.Member,
     roles: list[discord.Role],
     reason: str,
-    character_name: str | None = None,
+    character_name: Optional[str] = None,
 ) -> None:
     if not roles:
         return
@@ -898,7 +909,7 @@ async def remove_roles_automatically(
     member: discord.Member,
     roles: list[discord.Role],
     reason: str,
-    character_name: str | None = None,
+    character_name: Optional[str] = None,
 ) -> None:
     if not roles:
         return
@@ -1083,7 +1094,7 @@ async def apply_guild_rank(
 
 
 async def synchronize_guild_roles(
-    member: discord.Member | None = None,
+    member: Optional[discord.Member] = None,
 ) -> tuple[bool, int, int]:
     if not blizzard.configured:
         logger.warning("Синхронизация Blizzard отключена: заполните параметры в .env")
@@ -1673,7 +1684,7 @@ async def send_weekly_messages() -> None:
 
 def select_pidor_for_today(
     guild: discord.Guild,
-) -> tuple[discord.Member | None, bool]:
+) -> tuple[Optional[discord.Member], bool]:
     today = datetime.now(MSK).date().isoformat()
     saved_date = store.get_state("pidor_date")
     saved_member_id = store.get_state("pidor_member_id")
@@ -1682,7 +1693,7 @@ def select_pidor_for_today(
             selected = guild.get_member(int(saved_member_id))
         except ValueError:
             selected = None
-        if selected:
+        if selected and selected.id not in config.PIDOR_EXCLUDED_USER_IDS:
             return selected, False
 
     eligible_role_ids = {
@@ -1696,7 +1707,10 @@ def select_pidor_for_today(
             for role in guild.roles
             if role.id in eligible_role_ids
             for member in role.members
-            if not member.bot
+            if (
+                not member.bot
+                and member.id not in config.PIDOR_EXCLUDED_USER_IDS
+            )
         }
     )
     if not eligible:
@@ -1878,7 +1892,7 @@ async def absence(
 @app_commands.describe(raid_date="Необязательно: дата в формате ДД.ММ.ГГГГ")
 async def attendance_start(
     interaction: discord.Interaction,
-    raid_date: str | None = None,
+    raid_date: Optional[str] = None,
 ) -> None:
     if raid_date:
         try:
@@ -2012,7 +2026,7 @@ async def attendance_confirm(interaction: discord.Interaction) -> None:
     )
 
 
-def validate_month(month: str | None) -> str:
+def validate_month(month: Optional[str]) -> str:
     value = month or datetime.now(MSK).strftime("%Y-%m")
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
         raise ValueError("Месяц должен быть в формате ГГГГ-ММ")
@@ -2020,7 +2034,7 @@ def validate_month(month: str | None) -> str:
 
 
 def attendance_summary(
-    rows, guild: discord.Guild, member_id: int | None = None
+    rows, guild: discord.Guild, member_id: Optional[int] = None
 ) -> list[str]:
     grouped: dict[int, dict[str, int]] = {}
     for row in rows:
@@ -2069,7 +2083,9 @@ def attendance_summary(
     "Команда доступна только участникам состава и Друзьям.",
 )
 @app_commands.describe(month="Месяц в формате ГГГГ-ММ")
-async def attendance(interaction: discord.Interaction, month: str | None = None) -> None:
+async def attendance(
+    interaction: discord.Interaction, month: Optional[str] = None
+) -> None:
     try:
         month_key = validate_month(month)
     except ValueError as error:
@@ -2092,7 +2108,7 @@ async def attendance(interaction: discord.Interaction, month: str | None = None)
 async def attendance_member(
     interaction: discord.Interaction,
     member: discord.Member,
-    month: str | None = None,
+    month: Optional[str] = None,
 ) -> None:
     try:
         month_key = validate_month(month)
@@ -2198,7 +2214,7 @@ async def link_characters(
 @app_commands.describe(member="Необязательно: показать только одного участника")
 async def links(
     interaction: discord.Interaction,
-    member: discord.Member | None = None,
+    member: Optional[discord.Member] = None,
 ) -> None:
     await interaction.response.defer(ephemeral=True)
     grouped: dict[int, set[str]] = {}
@@ -2249,7 +2265,7 @@ async def links(
 async def unlink(
     interaction: discord.Interaction,
     member: discord.Member,
-    character: str | None = None,
+    character: Optional[str] = None,
 ) -> None:
     character = character.strip() if character else None
     configured_names = config.DISCORD_CHARACTER_LINKS.get(member.id, [])
@@ -2350,7 +2366,7 @@ async def sync_member(
     )
 
 
-def frzok_mention(guild: discord.Guild) -> str | None:
+def frzok_mention(guild: discord.Guild) -> Optional[str]:
     if config.FRZOK_USER_ID:
         return f"<@{config.FRZOK_USER_ID}>"
     expected_names = {"frzok", "fearzok"}
@@ -2676,7 +2692,7 @@ async def backup_restore(
     )
 
 
-async def find_manual_role_actor(member: discord.Member) -> int | None:
+async def find_manual_role_actor(member: discord.Member) -> Optional[int]:
     try:
         async for entry in member.guild.audit_logs(
             limit=6,
