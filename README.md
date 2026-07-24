@@ -1,85 +1,166 @@
-# Discord Bot README
+# Shadow Squad Discord Bot
 
-## Overview
+Бот управляет ролями гильдии, гостевым доступом, временными голосовыми
+комнатами и развлекательной недельной статистикой.
 
-This bot is designed to manage various tasks within a Discord server, including channel management, role assignments, and special features like the "Pidor of the Day" game. The bot is built using the `discord.py` library and is intended to automate server management tasks and provide some fun interactions for the members.
+## Что делает бот
 
-## Features
+- выдаёт новому участнику роль «Гости» на 7 дней;
+- сохраняет срок гостевой роли в SQLite, поэтому перезапуск не сбрасывает таймер;
+- создаёт временную комнату при входе в каналы `24/7` или `Ключ`;
+- сохраняет созданные комнаты и таймер их удаления между перезапусками;
+- сохраняет ежедневный выбор и недельную статистику;
+- автоматически запускает выбор участника дня ежедневно в 20:30 МСК;
+- сбрасывает недельную статистику по средам в 05:00 МСК;
+- синхронизирует гильдейские роли через Blizzard API ежедневно в 08:00,
+  13:00 и 19:00 МСК;
+- при нескольких персонажах оставляет только роль самого высокого ранга
+  (в Blizzard ранг `0` выше ранга `1`).
+- публикует только фактические добавления и снятия ролей в служебный
+  Discord-канал `723427989521432628`;
+- повторяет неудачные запросы Blizzard API, ограничивает частоту запросов и
+  хранит последний успешно полученный состав;
+- снимает гильдейскую роль только после 48 часов подтверждённого отсутствия
+  персонажа в составе;
+- выдаёт роль «Хила на крутилах» Сержантам, у которых хотя бы один
+  сопоставленный персонаж играет в активной специализации лекаря;
+- снимает роль «Хила на крутилах» при смене гильдейского ранга, специализации
+  или после 48 часов подтверждённого отсутствия в гильдии;
+- автоматически учитывает посещаемость основного РТ по пятницам и воскресеньям
+  с 21:00 до 00:00 МСК в голосовом канале `713419816857370624`;
+- сохраняет историю автоматических и ручных изменений гильдейских ролей;
+- создаёт проверяемую резервную копию SQLite ежедневно в 04:30 МСК.
 
-### 1. Automatic Role Assignment
-- **Guest Role Assignment**: New members are automatically assigned the "Guest" role upon joining the server.
-- **Role Duration Management**: The bot periodically checks and removes the "Guest" role from members who have exceeded the designated time limit.
+Соответствие рангов Blizzard:
 
-### 2. Voice Channel Management
-- **Temporary Voice Channels**: When a user joins a specified voice channel, the bot creates a temporary voice channel for them, with limits on the number of channels a user can create.
-- **Empty Channel Cleanup**: The bot monitors temporary voice channels and deletes them if they remain empty for a certain period.
+| Ранг | Discord-роль |
+| ---: | --- |
+| 0 | RL |
+| 1 | Знаменосец |
+| 2 | Сержант |
+| 3 | Летописец |
+| 4 | Рекрут |
 
-### 3. Scheduled Messaging
-- **Weekly Reminders**: The bot sends scheduled messages to specific channels on designated days (e.g., Fridays and Sundays at 20:30).
+## Установка
 
-### 4. "Pidor of the Day" Game
-- **Daily Selection**: The bot randomly selects a "Pidor of the Day" from eligible members with certain roles.
-- **Statistics Tracking**: The bot keeps track of how many times each member has been chosen as the "Pidor of the Day" and resets the stats weekly.
+Требуется Python 3.10 или новее.
 
-### 5. Message Deletion
-- **Targeted Deletion**: Automatically deletes messages from a specific user after a short delay.
+```powershell
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-### 6. Member Updates
-- **Role-based Welcome Messages**: Sends a welcome message via DM when a member receives a specific role (e.g., "Sergeant").
+Заполните `.env`:
 
-## Setup
+- `DISCORD_BOT_TOKEN`;
+- `BLIZZARD_CLIENT_ID` и `BLIZZARD_CLIENT_SECRET` OAuth-клиента Battle.net;
+- `BLIZZARD_REGION`, `BLIZZARD_REALM_SLUG` и `BLIZZARD_GUILD_SLUG`;
+- при необходимости переопределите `FRZOK_USER_ID`, `PIDOR_CHANNEL_ID` и
+  `STATE_DB_PATH`.
 
-### Prerequisites
-- Python 3.8 or later.
-- `discord.py` library.
-- `python-dotenv` for loading environment variables.
+Запуск:
 
-### Configuration
+```powershell
+python bot.py
+```
 
-1. **Environment Variables**: Create a `.env` file to store sensitive information like the bot token.
-   ```
-   DISCORD_BOT_TOKEN=your_bot_token_here
-   ```
+Файл `bot_state.sqlite3` создаётся автоматически. Его нельзя удалять при
+обновлении или перезапуске бота.
 
-2. **Configuration File (`config.py`)**:
-   - `GUILD_ID`: The ID of the server where the bot operates.
-   - `GUEST_ROLE_ID`: Role ID for the "Guest" role.
-   - `GUEST_ROLE_DURATION`: Duration (in days) for which a user should keep the "Guest" role.
-   - `TARGET_CHANNEL_IDS`: List of channel IDs where the bot should create temporary voice channels.
-   - `TEMP_CHANNEL_CATEGORY_ID`: Category ID where temporary voice channels are created.
-   - `MAX_CHANNELS_PER_USER`: Maximum number of temporary channels a user can create.
-   - `MAX_USERS_PER_TEMP_CHANNEL`: Maximum number of users allowed in a temporary channel.
-   - `CHANNEL_ID`: Channel ID where scheduled messages are sent.
-   - `ROLE_ID`: Role ID to mention in scheduled messages.
-   - `USER_ID`: User ID to mention in scheduled messages.
-   - `ROLE_IDS`: Dictionary containing role IDs for "Sergeant", "Ochko", and "RL".
-   - `MESSAGES`: Dictionary containing custom messages for different bot actions.
+## Как участник связывается с персонажем
 
-### Running the Bot
+По умолчанию бот ищет имя персонажа в серверном нике, глобальном имени и
+Discord-логине участника. Например, ник `Main | Иван` сопоставится с
+персонажем `Main`.
 
-1. Ensure all dependencies are installed:
-   ```bash
-   pip install discord.py python-dotenv
-   ```
+Если ник не совпадает или у участника есть несколько персонажей, пользователь
+с правом «Управление ролями» может выполнить:
 
-2. Start the bot by running the Python script:
-   ```bash
-   python your_script_name.py
-   ```
+```text
+/link member:@Участник characters:Main, Alt
+```
 
-## Usage
+Команда проверяет персонажей по составу Blizzard и запрещает привязать одного
+персонажа нескольким людям. Связи сохраняются в SQLite. Их также можно заранее
+передать через `DISCORD_CHARACTER_LINKS` в `.env`; пример находится в
+`.env.example`.
 
-- **Pidor of the Day**: Use the `/pidor_of_the_day` command to randomly select a "Pidor of the Day".
-- **Weekly Pidor Stats**: Use the `/pidors_of_the_week` command to display the weekly statistics of the "Pidor of the Day" game.
+## Административные команды
 
-## Error Handling
+Команды управления ролями и объявлениями доступны пользователям с правом
+«Управление ролями»:
 
-- The bot includes basic error handling to log unexpected errors and handle Discord-specific exceptions like message deletion restrictions and failed DMs.
+- `/link` — проверить и сохранить персонажей участника;
+- `/links` — показать все привязки или привязки выбранного участника;
+- `/unlink` — удалить одну или все локальные привязки участника;
+- `/sync` — немедленно обновить роли всего сервера;
+- `/sync_member` — обновить роль одного участника;
+- `/sync_status` — показать последнюю успешную синхронизацию, следующий запуск,
+  размер состава и последнюю ошибку API;
+- `/heroic` — опубликовать сбор в героик в рейдовом канале;
+- `/rt_start` — опубликовать начало сбора на РТ;
+- `/bot_status` — проверить базу, Blizzard API, фоновые задачи, комнаты и
+  гостевые таймеры;
+- `/role_history` — показать последние изменения ролей участника.
 
-## Contributing
+Команды `/backup_status` и `/backup_restore` требуют право «Управление
+сервером».
 
-To contribute to this project, please fork the repository and submit a pull request. Ensure your code follows the project's coding standards and is well-documented.
+Команда `/roster` доступна всем участникам и приватно показывает ссылку на
+таблицу состава. Роль «Друзья» полностью исключена из автоматического
+управления и может выдаваться или сниматься только вручную.
 
-## License
+Автоматический `/pidor_of_the_day` публикуется в канале
+`810474409755541524`. Канал можно переопределить через `PIDOR_CHANNEL_ID`
+в `.env`. Команда `/pidors_of_the_week` показывает накопленную недельную
+статистику; она автоматически очищается по средам в 05:00 МСК.
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+## Посещаемость РТ
+
+Автоматическая сессия начинается по пятницам и воскресеньям в 21:00 МСК и
+завершается в 00:00. Бот каждую минуту сохраняет время участников в РТ-канале.
+После завершения создаётся черновик:
+
+- присутствие засчитывается при нахождении в канале не менее 60% РТ;
+- вход позже 21:15 отмечается как опоздание;
+- резерв засчитывается как полное посещение;
+- предупреждённый пропуск исключается из расчёта процента.
+
+Предупреждения об отсутствии или опоздании принимаются в канале
+`1200807297111306280`. Бот ставит под сообщением `✅` и связывает его с
+ближайшим РТ. Дату можно указать в сообщении в формате `ДД.ММ` или
+`ДД.ММ.ГГГГ`. Если удалить реакцию бота или само сообщение, предупреждение
+отзывается и пропуск снова учитывается. После перезапуска реакции сверяются с
+сохранёнными записями.
+
+Команды:
+
+- `/absence` — опубликовать предупреждение в специальном канале;
+- `/attendance_current` — проверить активную сессию или последний черновик;
+- `/attendance_mark` — вручную исправить статус игрока;
+- `/attendance_confirm` — подтвердить результаты;
+- `/attendance` — месячная сводка;
+- `/attendance_member` — история выбранного игрока;
+- `/attendance_start` и `/attendance_end` — ручное управление сессией.
+
+## Резервные копии
+
+Копии находятся в каталоге `backups`, исключённом из Git. Хранятся последние
+30 дней. Перед `/backup_restore` проверяется целостность файла и создаётся
+дополнительная копия текущей базы. Для восстановления необходимо ввести
+подтверждение `ВОССТАНОВИТЬ`.
+
+## Права Discord
+
+В Discord Developer Portal у бота должны быть включены привилегированные
+`Server Members Intent` и `Message Content Intent`. На сервере ему нужны права:
+
+- управление ролями;
+- управление и перемещение участников в голосовых каналах;
+- управление каналами;
+- отправка сообщений;
+- добавление реакций;
+- чтение истории сообщений;
+- просмотр журнала аудита — для определения автора ручного изменения ролей.
+
+Роль бота должна находиться выше всех ролей, которыми он управляет.

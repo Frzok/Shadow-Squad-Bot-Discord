@@ -6,7 +6,7 @@ By using the Shadow-Squad-Bot-Discord (the "Bot"), you agree to be bound by thes
 
 ## 2. Description of the Bot
 
-The Bot is a Discord application designed to assist with server management and provide various features to enhance the user experience within Discord servers.
+The Bot is a Discord application for the Shadow Squad guild. Its features include Discord role synchronization with Blizzard guild data, temporary voice channels, guest-role timers, raid announcements and attendance, character links, backups, and guild statistics.
 
 ## 3. User Responsibilities
 
@@ -16,7 +16,7 @@ The Bot is a Discord application designed to assist with server management and p
 
 ## 4. Privacy and Data Collection
 
-The Bot may collect and store certain data as needed for its functionality. This data may include user IDs, messages, and server-specific settings. We do not share this data with third parties unless required by law. For more information, please refer to our Privacy Policy.
+The Bot stores data needed for its functionality, including Discord user IDs, relevant absence-channel messages, role history, World of Warcraft character links, attendance, timers, and server-specific settings. The Bot relies on Discord and Blizzard services. For details about storage, retention, and user rights, please refer to our Privacy Policy.
 
 ## 5. Modifications to the Bot and Terms
 
