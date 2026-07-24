@@ -13,7 +13,7 @@ When you interact with the Bot, we may collect the following types of informatio
 - **User ID**: We collect your Discord user ID to identify users and perform bot functions.
 - **Discord Profile Data**: We process usernames, display names, nicknames, and role membership to identify guild members and perform Bot functions.
 - **Server ID**: We process the configured Discord server ID and relevant channel and role IDs.
-- **Message Content**: We process messages posted in the configured raid absence channel. The message text may be stored as the reason for an absence or late arrival until the associated record is removed.
+- **Message Content**: We process messages posted in the configured raid absence channel. The message text may be stored as the reason for an absence or late arrival until the associated record is removed. For tactics reminders, we store the source message ID, author ID, channel ID, and due time, then verify that the source message still exists before sending the reminder; its content is not copied into the database.
 - **World of Warcraft Character Data**: We store character names linked to Discord users, guild ranks, realm identifiers, and cached active specialization information obtained from the Blizzard API.
 
 ### 2.2. Interaction Data

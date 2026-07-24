@@ -291,6 +291,10 @@ def raid_voice_member_ids(guild: discord.Guild) -> set[int]:
     return {member.id for member in channel.members if not member.bot}
 
 
+def temporary_channel_name(member: discord.Member) -> str:
+    return (member.nick or member.display_name or member.name)[:100]
+
+
 def eligible_raid_members(guild: discord.Guild) -> set[discord.Member]:
     role_ids = set(config.GUILD_RANK_ROLE_IDS.values())
     return {
@@ -1075,6 +1079,7 @@ async def on_ready() -> None:
     for loop in (
         check_guest_roles,
         check_empty_channels,
+        check_tactics_reminders,
         send_weekly_messages,
         reset_weekly_stats,
         scheduled_role_sync,
@@ -1121,6 +1126,10 @@ async def on_member_join(member: discord.Member) -> None:
     if guest_role:
         await member.add_roles(guest_role, reason="Новый участник сервера")
         store.set_guest(member.id, utc_timestamp())
+        try:
+            await member.send(config.MESSAGES["GUEST_WELCOME_MESSAGE"])
+        except (discord.Forbidden, discord.HTTPException):
+            logger.info("Не удалось отправить гостевое приветствие %s", member)
     await synchronize_guild_roles(member)
 
 
@@ -1134,6 +1143,19 @@ async def on_member_remove(member: discord.Member) -> None:
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
+    if (
+        message.channel.id == config.TACTICS_CHANNEL_ID
+        and message.author.id == config.FRZOK_USER_ID
+    ):
+        store.save_tactics_reminder(
+            message.id,
+            message.author.id,
+            message.channel.id,
+            config.TACTICS_NOTIFICATION_CHANNEL_ID,
+            message.created_at.timestamp()
+            + config.TACTICS_REMINDER_DELAY_HOURS * 3600,
+            message.created_at.timestamp(),
+        )
     if message.channel.id == config.RAID_ABSENCE_CHANNEL_ID:
         try:
             raid_date = raid_date_from_notice(message.content)
@@ -1209,6 +1231,8 @@ async def on_raw_reaction_clear(payload: discord.RawReactionClearEvent) -> None:
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     if payload.channel_id == config.RAID_ABSENCE_CHANNEL_ID:
         revoke_raid_notice(payload.message_id)
+    elif payload.channel_id == config.TACTICS_CHANNEL_ID:
+        store.remove_tactics_reminder(payload.message_id)
 
 
 @bot.event
@@ -1218,6 +1242,9 @@ async def on_raw_bulk_message_delete(
     if payload.channel_id == config.RAID_ABSENCE_CHANNEL_ID:
         for message_id in payload.message_ids:
             revoke_raid_notice(message_id)
+    elif payload.channel_id == config.TACTICS_CHANNEL_ID:
+        for message_id in payload.message_ids:
+            store.remove_tactics_reminder(message_id)
 
 
 @tasks.loop(minutes=1)
@@ -1269,6 +1296,58 @@ async def check_empty_channels() -> None:
             store.remove_temp_channel(channel_id)
 
 
+@tasks.loop(minutes=1)
+async def check_tactics_reminders() -> None:
+    guild = bot.get_guild(config.GUILD_ID)
+    if guild is None:
+        return
+
+    for reminder in store.due_tactics_reminders(utc_timestamp()):
+        source = guild.get_channel(int(reminder["source_channel_id"]))
+        target = guild.get_channel(int(reminder["target_channel_id"]))
+        if source is None or not hasattr(source, "fetch_message"):
+            logger.error(
+                "Канал тактик %s не найден",
+                reminder["source_channel_id"],
+            )
+            continue
+        if target is None or not hasattr(target, "send"):
+            logger.error(
+                "Канал уведомлений о тактиках %s не найден",
+                reminder["target_channel_id"],
+            )
+            continue
+
+        try:
+            source_message = await source.fetch_message(int(reminder["message_id"]))
+        except discord.NotFound:
+            store.remove_tactics_reminder(int(reminder["message_id"]))
+            continue
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Не удалось проверить сообщение с тактикой %s",
+                reminder["message_id"],
+            )
+            continue
+
+        author = guild.get_member(int(reminder["author_id"]))
+        author_name = author.display_name if author else "Frzok"
+        try:
+            await target.send(
+                f"<@&{config.ROLE_IDS['SERGEANT']}> "
+                f"**{author_name}** опубликовала новую тактику по боссам. "
+                "Пожалуйста, ознакомьтесь с ней до ближайшего РТ:\n"
+                f"{source_message.jump_url}"
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Не удалось отправить напоминание о тактике %s",
+                reminder["message_id"],
+            )
+            continue
+        store.remove_tactics_reminder(int(reminder["message_id"]))
+
+
 @bot.event
 async def on_voice_state_update(
     member: discord.Member,
@@ -1290,11 +1369,43 @@ async def on_voice_state_update(
             store.attendance_leave(session_id, member.id, utc_timestamp())
 
     if after.channel and after.channel.id in config.TARGET_CHANNEL_IDS:
-        count = store.owner_channel_count(member.id)
-        if count < config.MAX_CHANNELS_PER_USER:
-            source = after.channel
+        source = after.channel
+        owned_channels: list[discord.VoiceChannel] = []
+        for channel_id, owner_id, _ in store.temp_channels():
+            if owner_id != member.id:
+                continue
+            channel = member.guild.get_channel(channel_id)
+            if isinstance(channel, discord.VoiceChannel):
+                owned_channels.append(channel)
+            else:
+                store.remove_temp_channel(channel_id)
+
+        if owned_channels:
+            existing_channel = owned_channels[0]
+            if not existing_channel.members:
+                try:
+                    await existing_channel.edit(
+                        name=temporary_channel_name(member),
+                        category=source.category,
+                        user_limit=config.MAX_USERS_PER_TEMP_CHANNEL,
+                        reason=f"Переиспользование временной комнаты для {member}",
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception(
+                        "Не удалось обновить временную комнату %s",
+                        existing_channel,
+                    )
+            store.set_channel_empty_since(existing_channel.id, None)
+            try:
+                await member.move_to(existing_channel)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "Не удалось переместить %s в существующую комнату",
+                    member,
+                )
+        elif len(owned_channels) < config.MAX_CHANNELS_PER_USER:
             new_channel = await member.guild.create_voice_channel(
-                f"{source.name} {count + 1}",
+                temporary_channel_name(member),
                 category=source.category,
                 user_limit=config.MAX_USERS_PER_TEMP_CHANNEL,
                 reason=f"Временная комната для {member}",
@@ -2095,6 +2206,7 @@ async def bot_status(interaction: discord.Interaction) -> None:
         for loop in (
             check_guest_roles,
             check_empty_channels,
+            check_tactics_reminders,
             send_weekly_messages,
             reset_weekly_stats,
             scheduled_role_sync,
@@ -2122,7 +2234,9 @@ async def bot_status(interaction: discord.Interaction) -> None:
                 f"Активные предупреждения РТ: {counts['raid_notices']}",
                 f"История ролей: {counts['role_history']} записей",
                 f"Резервные копии: {len(backup_files())}",
-                f"Запущенные фоновые задачи: {loops_running}/10",
+                f"Ожидающие напоминания о тактиках: "
+                f"{counts['tactics_reminders']}",
+                f"Запущенные фоновые задачи: {loops_running}/11",
                 f"Следующая синхронизация: {next_sync}",
                 "Автовыбор участника дня: ежедневно в 20:30 МСК",
                 "Учёт РТ: Пт/Вс, 21:00–00:00 МСК",

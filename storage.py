@@ -110,6 +110,14 @@ class StateStore:
                     character_name TEXT,
                     reason TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS tactics_reminders (
+                    message_id INTEGER PRIMARY KEY,
+                    author_id INTEGER NOT NULL,
+                    source_channel_id INTEGER NOT NULL,
+                    target_channel_id INTEGER NOT NULL,
+                    due_at REAL NOT NULL,
+                    created_at REAL NOT NULL
+                );
                 """
             )
             # Старые версии разрешали привязать одного персонажа нескольким
@@ -837,6 +845,58 @@ class StateStore:
                 (member_id, limit),
             ).fetchall()
 
+    def save_tactics_reminder(
+        self,
+        message_id: int,
+        author_id: int,
+        source_channel_id: int,
+        target_channel_id: int,
+        due_at: float,
+        created_at: float,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO tactics_reminders(
+                    message_id, author_id, source_channel_id,
+                    target_channel_id, due_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    author_id=excluded.author_id,
+                    source_channel_id=excluded.source_channel_id,
+                    target_channel_id=excluded.target_channel_id,
+                    due_at=excluded.due_at
+                """,
+                (
+                    message_id,
+                    author_id,
+                    source_channel_id,
+                    target_channel_id,
+                    due_at,
+                    created_at,
+                ),
+            )
+
+    def due_tactics_reminders(self, now: float) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT message_id, author_id, source_channel_id,
+                       target_channel_id, due_at, created_at
+                FROM tactics_reminders
+                WHERE due_at <= ?
+                ORDER BY due_at, message_id
+                """,
+                (now,),
+            ).fetchall()
+
+    def remove_tactics_reminder(self, message_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM tactics_reminders WHERE message_id=?",
+                (message_id,),
+            )
+
     def backup_to(self, destination: str | Path) -> None:
         destination_path = Path(destination)
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -887,6 +947,7 @@ class StateStore:
             "attendance": "attendance_records",
             "raid_notices": "raid_notice_messages",
             "role_history": "role_history",
+            "tactics_reminders": "tactics_reminders",
         }
         result: dict[str, int] = {}
         with self._lock:
