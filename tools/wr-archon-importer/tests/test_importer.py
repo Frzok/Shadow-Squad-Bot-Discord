@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ MODULE_PATH = Path(__file__).parents[1] / "wr_archon_importer.py"
 SPEC = importlib.util.spec_from_file_location("wr_archon_importer", MODULE_PATH)
 assert SPEC and SPEC.loader
 importer = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = importer
 SPEC.loader.exec_module(importer)
 
 
