@@ -15,6 +15,7 @@ When you interact with the Bot, we may collect the following types of informatio
 - **Server ID**: We process the configured Discord server ID and relevant channel and role IDs.
 - **Message Content**: We process messages posted in the configured raid absence channel. The message text may be stored as the reason for an absence or late arrival until the associated record is removed. For tactics reminders, we store the source message ID, author ID, channel ID, and due time, then verify that the source message still exists before sending the reminder; its content is not copied into the database.
 - **World of Warcraft Character Data**: We store character names linked to Discord users, guild ranks, realm identifiers, and cached active specialization information obtained from the Blizzard API.
+- **Loot History**: We process RCLootCouncil loot records obtained from WoW Audit, including item, recipient, award time, difficulty, response category, notes, and the character that awarded the item. The database stores the IDs of records already announced to prevent duplicate Discord posts.
 
 ### 2.2. Interaction Data
 

@@ -16,6 +16,7 @@ from discord.ext import commands, tasks
 import config
 from blizzard import BlizzardAPIError, BlizzardClient, GuildCharacter
 from storage import StateStore
+from wowaudit import LootHistoryItem, WoWAuditAPIError, WoWAuditClient
 
 
 logging.basicConfig(
@@ -43,13 +44,17 @@ blizzard = BlizzardClient(
     config.BLIZZARD_REALM_SLUG,
     config.BLIZZARD_GUILD_SLUG,
 )
+wowaudit = WoWAuditClient(config.WOWAUDIT_API_KEY)
 startup_complete = False
 role_sync_lock = asyncio.Lock()
 roster_fetch_lock = asyncio.Lock()
 character_profile_semaphore = asyncio.Semaphore(4)
 pidor_lock = asyncio.Lock()
 attendance_lock = asyncio.Lock()
+wowaudit_fetch_lock = asyncio.Lock()
 last_roster_request_monotonic = 0.0
+last_wowaudit_fetch_at = 0.0
+wowaudit_loot_cache: tuple[str, list[LootHistoryItem]] | None = None
 specialization_role_cache: dict[int, str] = {}
 suppressed_role_events: dict[tuple[int, int, str], float] = {}
 PROCESS_STARTED_AT = datetime.now(MSK)
@@ -62,6 +67,55 @@ ATTENDANCE_STATUS_LABELS = {
     "absent": "Отсутствовал",
     "pending": "Ожидает проверки",
 }
+
+
+GUILD_MEMBER_COMMAND_ROLE_IDS = frozenset(
+    {
+        config.ROLE_IDS["RL"],
+        config.ROLE_IDS["BANNER_BEARER"],
+        config.ROLE_IDS["SERGEANT"],
+        config.ROLE_IDS["CHRONICLER"],
+        config.ROLE_IDS["RECRUIT"],
+        config.ROLE_IDS["FRIENDS"],
+    }
+)
+RAIDER_COMMAND_ROLE_IDS = frozenset(
+    {
+        config.ROLE_IDS["RL"],
+        config.ROLE_IDS["BANNER_BEARER"],
+        config.ROLE_IDS["SERGEANT"],
+    }
+)
+OFFICER_COMMAND_ROLE_IDS = frozenset(
+    {
+        config.ROLE_IDS["RL"],
+        config.ROLE_IDS["BANNER_BEARER"],
+    }
+)
+
+
+class RoleAccessDenied(app_commands.CheckFailure):
+    """Понятная пользователю ошибка проверки серверной роли."""
+
+
+def has_command_role(
+    allowed_role_ids: frozenset[int],
+    error_message: str,
+):
+    async def predicate(interaction: discord.Interaction) -> bool:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            raise RoleAccessDenied("Эту команду можно использовать только на сервере.")
+        if member.guild_permissions.administrator:
+            return True
+        member_role_ids = {role.id for role in member.roles}
+        if config.GUEST_ROLE_ID in member_role_ids:
+            raise RoleAccessDenied("Гостям доступна только команда /roster.")
+        if member_role_ids & allowed_role_ids:
+            return True
+        raise RoleAccessDenied(error_message)
+
+    return app_commands.check(predicate)
 
 
 def utc_timestamp() -> float:
@@ -390,6 +444,11 @@ async def finish_raid_attendance(
             counts[status] = counts.get(status, 0) + 1
 
         store.finish_raid_session(session_id, end_timestamp, status="draft")
+        store.enqueue_raid_loot_report(
+            session_id,
+            max(end_timestamp, utc_timestamp())
+            + config.RAID_LOOT_REPORT_DELAY_MINUTES * 60,
+        )
         announcement_channel = bot.get_channel(config.RAID_ANNOUNCEMENT_CHANNEL_ID)
         if announcement_channel and hasattr(announcement_channel, "send"):
             await announcement_channel.send(
@@ -501,6 +560,79 @@ async def scheduled_database_backup() -> None:
         logger.info("Создана резервная копия %s", backup.name)
     except (OSError, sqlite3.Error):
         logger.exception("Не удалось создать ежедневную резервную копию")
+
+
+async def fetch_wowaudit_loot(
+    force: bool = False,
+) -> tuple[str, list[LootHistoryItem]]:
+    global last_wowaudit_fetch_at, wowaudit_loot_cache
+
+    now = time.monotonic()
+    if (
+        not force
+        and wowaudit_loot_cache is not None
+        and now - last_wowaudit_fetch_at <= config.WOWAUDIT_LOOT_CACHE_SECONDS
+    ):
+        return wowaudit_loot_cache
+
+    async with wowaudit_fetch_lock:
+        now = time.monotonic()
+        if (
+            not force
+            and wowaudit_loot_cache is not None
+            and now - last_wowaudit_fetch_at <= config.WOWAUDIT_LOOT_CACHE_SECONDS
+        ):
+            return wowaudit_loot_cache
+        try:
+            result = await wowaudit.loot_history()
+        except WoWAuditAPIError as error:
+            store.set_state("last_wowaudit_error", str(error))
+            store.set_state("last_wowaudit_error_at", datetime.now(MSK).isoformat())
+            raise
+        wowaudit_loot_cache = result
+        last_wowaudit_fetch_at = time.monotonic()
+        store.set_state("last_wowaudit_success", datetime.now(MSK).isoformat())
+        store.set_state("last_wowaudit_error", "")
+        return result
+
+
+def format_loot_timestamp(value: str) -> str:
+    if not value:
+        return "дата неизвестна"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return value
+
+
+def parse_loot_timestamp(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def loot_history_line(item: LootHistoryItem) -> str:
+    details = [
+        value
+        for value in (
+            item.difficulty.capitalize(),
+            item.response,
+            format_loot_timestamp(item.awarded_at),
+        )
+        if value
+    ]
+    item_link = f"https://www.wowhead.com/item={item.item_id}"
+    return (
+        f"• **{item.recipient_name}** — [{item.name}]({item_link})"
+        f"\n  {' · '.join(details)}"
+    )
 
 
 def cached_guild_roster() -> tuple[list[GuildCharacter], float | None]:
@@ -1080,6 +1212,7 @@ async def on_ready() -> None:
         check_guest_roles,
         check_empty_channels,
         check_tactics_reminders,
+        check_raid_loot_reports,
         send_weekly_messages,
         reset_weekly_stats,
         scheduled_role_sync,
@@ -1104,6 +1237,8 @@ async def on_app_command_error(
             "Эта версия slash-команды устарела. Подождите обновления списка "
             "Discord и выберите команду заново."
         )
+    elif isinstance(error, RoleAccessDenied):
+        message = str(error)
     elif isinstance(error, app_commands.MissingPermissions):
         message = "Для этой команды недостаточно прав."
     else:
@@ -1348,6 +1483,75 @@ async def check_tactics_reminders() -> None:
         store.remove_tactics_reminder(int(reminder["message_id"]))
 
 
+@tasks.loop(minutes=config.RAID_LOOT_REPORT_RETRY_MINUTES)
+async def check_raid_loot_reports() -> None:
+    if not wowaudit.configured:
+        return
+    guild = bot.get_guild(config.GUILD_ID)
+    if guild is None:
+        return
+    channel = guild.get_channel(config.LOOT_HISTORY_CHANNEL_ID)
+    if channel is None or not hasattr(channel, "send"):
+        logger.error(
+            "Канал публикации истории лута %s не найден",
+            config.LOOT_HISTORY_CHANNEL_ID,
+        )
+        return
+
+    for report in store.due_raid_loot_reports(utc_timestamp()):
+        session_id = int(report["session_id"])
+        try:
+            season_name, items = await fetch_wowaudit_loot(force=True)
+            raid_items = sorted(
+                (
+                    item
+                    for item in items
+                    if not item.discarded
+                    and (awarded_at := parse_loot_timestamp(item.awarded_at))
+                    is not None
+                    and float(report["started_at"])
+                    <= awarded_at
+                    <= float(report["ended_at"])
+                ),
+                key=lambda item: (item.awarded_at, item.id),
+            )
+
+            if raid_items:
+                raid_date = datetime.strptime(
+                    str(report["raid_date"]), "%Y-%m-%d"
+                ).strftime("%d.%m.%Y")
+                header = f"🎁 **Лут за РТ {raid_date} — {season_name}**"
+                current_lines = [header]
+                for item in raid_items:
+                    line = loot_history_line(item)
+                    candidate = "\n".join([*current_lines, line])
+                    if len(candidate) > 1900 and len(current_lines) > 1:
+                        await channel.send("\n".join(current_lines))
+                        current_lines = [header, line]
+                    else:
+                        current_lines.append(line)
+                if len(current_lines) > 1:
+                    await channel.send("\n".join(current_lines))
+                store.mark_wowaudit_loot_seen(
+                    [item.id for item in raid_items],
+                    utc_timestamp(),
+                )
+
+            store.complete_raid_loot_report(session_id, utc_timestamp())
+            logger.info(
+                "Отчёт по луту РТ #%s обработан: предметов=%s",
+                session_id,
+                len(raid_items),
+            )
+        except (WoWAuditAPIError, discord.Forbidden, discord.HTTPException) as error:
+            logger.exception("Не удалось опубликовать отчёт по луту РТ #%s", session_id)
+            store.fail_raid_loot_report(
+                session_id,
+                str(error),
+                utc_timestamp() + config.RAID_LOOT_REPORT_RETRY_MINUTES * 60,
+            )
+
+
 @bot.event
 async def on_voice_state_update(
     member: discord.Member,
@@ -1544,6 +1748,11 @@ async def scheduled_pidor_of_the_day() -> None:
 
 @bot.tree.command(name="pidor_of_the_day", description="Выбрать участника дня")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    RAIDER_COMMAND_ROLE_IDS,
+    "Команда доступна только рейдерам: Сержантам, Знаменосцам и RL.",
+)
 async def pidor_of_the_day(interaction: discord.Interaction) -> None:
     if interaction.channel_id:
         store.set_state("pidor_channel_id", str(interaction.channel_id))
@@ -1564,6 +1773,11 @@ async def pidor_of_the_day(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="pidors_of_the_week", description="Статистика за неделю")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
 async def pidors_of_the_week(interaction: discord.Interaction) -> None:
     stats = store.stats()
     if not stats:
@@ -1600,6 +1814,11 @@ async def send_ephemeral_chunks(
 
 @bot.tree.command(name="absence", description="Предупредить об отсутствии на РТ")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
 @app_commands.describe(
     raid_date="Дата РТ в формате ДД.ММ.ГГГГ",
     reason="Причина отсутствия",
@@ -1654,7 +1873,8 @@ async def absence(
 
 @bot.tree.command(name="attendance_start", description="Начать учёт посещаемости РТ")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 @app_commands.describe(raid_date="Необязательно: дата в формате ДД.ММ.ГГГГ")
 async def attendance_start(
     interaction: discord.Interaction,
@@ -1690,7 +1910,8 @@ async def attendance_start(
 
 @bot.tree.command(name="attendance_end", description="Завершить учёт посещаемости РТ")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def attendance_end(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     session_id, counts = await finish_raid_attendance(interaction.guild)
@@ -1706,7 +1927,8 @@ async def attendance_end(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="attendance_current", description="Показать текущий черновик РТ")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def attendance_current(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     session = store.active_raid_session() or store.latest_raid_session()
@@ -1735,7 +1957,8 @@ async def attendance_current(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="attendance_mark", description="Исправить статус участника РТ")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 @app_commands.choices(
     status=[
         app_commands.Choice(name="Присутствовал", value="present"),
@@ -1773,7 +1996,8 @@ async def attendance_mark(
 
 @bot.tree.command(name="attendance_confirm", description="Подтвердить черновик РТ")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def attendance_confirm(interaction: discord.Interaction) -> None:
     session = store.latest_raid_session()
     if not session or session["status"] != "draft":
@@ -1839,6 +2063,11 @@ def attendance_summary(
 
 @bot.tree.command(name="attendance", description="Посещаемость за месяц")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
 @app_commands.describe(month="Месяц в формате ГГГГ-ММ")
 async def attendance(interaction: discord.Interaction, month: str | None = None) -> None:
     try:
@@ -1854,6 +2083,11 @@ async def attendance(interaction: discord.Interaction, month: str | None = None)
 
 @bot.tree.command(name="attendance_member", description="Посещаемость участника")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
 @app_commands.describe(member="Участник Discord", month="Месяц в формате ГГГГ-ММ")
 async def attendance_member(
     interaction: discord.Interaction,
@@ -1881,7 +2115,8 @@ async def attendance_member(
 
 @bot.tree.command(name="link", description="Связать участника с персонажами WoW")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 @app_commands.describe(
     member="Участник Discord",
     characters="Имена персонажей через запятую",
@@ -1958,7 +2193,8 @@ async def link_characters(
 
 @bot.tree.command(name="links", description="Показать привязки персонажей")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 @app_commands.describe(member="Необязательно: показать только одного участника")
 async def links(
     interaction: discord.Interaction,
@@ -2004,7 +2240,8 @@ async def links(
 
 @bot.tree.command(name="unlink", description="Удалить привязку персонажа")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 @app_commands.describe(
     member="Участник Discord",
     character="Имя персонажа; оставьте пустым для удаления всех привязок",
@@ -2043,7 +2280,8 @@ async def unlink(
 
 @bot.tree.command(name="sync_status", description="Состояние синхронизации Blizzard")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def sync_status(interaction: discord.Interaction) -> None:
     last_error = store.get_state("last_api_error") or "нет"
     last_error_at = format_msk_timestamp(store.get_state("last_api_error_at"))
@@ -2067,7 +2305,8 @@ async def sync_status(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="sync", description="Вручную обновить роли из Blizzard")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def sync_roles(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True, thinking=True)
     success, roster_size, changed = await synchronize_guild_roles()
@@ -2089,7 +2328,8 @@ async def sync_roles(interaction: discord.Interaction) -> None:
     description="Обновить Blizzard-роль одного участника",
 )
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 @app_commands.describe(member="Участник Discord")
 async def sync_member(
     interaction: discord.Interaction,
@@ -2144,7 +2384,8 @@ async def publish_raid_announcement(
 
 @bot.tree.command(name="heroic", description="Объявить сбор в героик")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def heroic(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     mention = frzok_mention(interaction.guild)
@@ -2166,7 +2407,8 @@ async def heroic(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="rt_start", description="Объявить начало сбора на РТ")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def rt_start(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     mention = frzok_mention(interaction.guild)
@@ -2190,9 +2432,96 @@ async def roster_link(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(config.ROSTER_URL, ephemeral=True)
 
 
+@bot.tree.command(name="loot_history", description="Последние предметы из WoW Audit")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
+@app_commands.describe(limit="Количество записей от 1 до 25")
+async def loot_history(
+    interaction: discord.Interaction,
+    limit: app_commands.Range[int, 1, 25] = 10,
+) -> None:
+    if not wowaudit.configured:
+        await interaction.response.send_message(
+            "История лута не настроена: отсутствует WOWAUDIT_API_KEY.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        season_name, items = await fetch_wowaudit_loot()
+    except WoWAuditAPIError as error:
+        await interaction.followup.send(
+            f"Не удалось получить историю лута: {error}",
+            ephemeral=True,
+        )
+        return
+    visible_items = [item for item in items if not item.discarded][:limit]
+    lines = [f"🎁 Последний лут — {season_name}"]
+    lines.extend(
+        loot_history_line(item)
+        for item in visible_items
+    )
+    if not visible_items:
+        lines.append("Записей о выданном луте пока нет.")
+    await send_ephemeral_chunks(interaction, lines)
+
+
+@bot.tree.command(name="loot_member", description="История лута участника")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
+@app_commands.describe(
+    member="Участник Discord",
+    limit="Количество записей от 1 до 25",
+)
+async def loot_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    limit: app_commands.Range[int, 1, 25] = 10,
+) -> None:
+    if not wowaudit.configured:
+        await interaction.response.send_message(
+            "История лута не настроена: отсутствует WOWAUDIT_API_KEY.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        season_name, items = await fetch_wowaudit_loot()
+    except WoWAuditAPIError as error:
+        await interaction.followup.send(
+            f"Не удалось получить историю лута: {error}",
+            ephemeral=True,
+        )
+        return
+
+    candidates = member_character_candidates(member)
+    member_items = [
+        item
+        for item in items
+        if not item.discarded
+        and normalize_character_name(item.recipient_name) in candidates
+    ][:limit]
+    lines = [f"🎁 Лут {member.display_name} — {season_name}"]
+    lines.extend(loot_history_line(item) for item in member_items)
+    if not member_items:
+        lines.append(
+            "Лут не найден. Проверьте привязку персонажей участника командой /links."
+        )
+    await send_ephemeral_chunks(interaction, lines)
+
+
 @bot.tree.command(name="bot_status", description="Административное состояние бота")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def bot_status(interaction: discord.Interaction) -> None:
     counts = store.counts()
     uptime = datetime.now(MSK) - PROCESS_STARTED_AT
@@ -2207,6 +2536,7 @@ async def bot_status(interaction: discord.Interaction) -> None:
             check_guest_roles,
             check_empty_channels,
             check_tactics_reminders,
+            check_raid_loot_reports,
             send_weekly_messages,
             reset_weekly_stats,
             scheduled_role_sync,
@@ -2223,6 +2553,9 @@ async def bot_status(interaction: discord.Interaction) -> None:
                 "🩺 Состояние бота",
                 f"База данных: {'✅ исправна' if store.is_healthy() else '❌ ошибка'}",
                 f"Blizzard API: {'✅ настроен' if blizzard.configured else '❌ не настроен'}",
+                f"WoW Audit API: {'✅ настроен' if wowaudit.configured else '❌ не настроен'}",
+                "Последний ответ WoW Audit: "
+                + format_msk_timestamp(store.get_state("last_wowaudit_success")),
                 f"Ошибок API подряд: {parse_state_int('api_failure_count')}",
                 f"Последний состав: {counts['roster']} персонажей",
                 f"Кэш специализаций: {counts['spec_cache']} персонажей",
@@ -2236,7 +2569,8 @@ async def bot_status(interaction: discord.Interaction) -> None:
                 f"Резервные копии: {len(backup_files())}",
                 f"Ожидающие напоминания о тактиках: "
                 f"{counts['tactics_reminders']}",
-                f"Запущенные фоновые задачи: {loops_running}/11",
+                f"Учтённые записи WoW Audit: {counts['wowaudit_loot_seen']}",
+                f"Запущенные фоновые задачи: {loops_running}/12",
                 f"Следующая синхронизация: {next_sync}",
                 "Автовыбор участника дня: ежедневно в 20:30 МСК",
                 "Учёт РТ: Пт/Вс, 21:00–00:00 МСК",
@@ -2251,7 +2585,8 @@ async def bot_status(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="backup_status", description="Состояние резервных копий")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
 async def backup_status(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     files = backup_files()
@@ -2286,7 +2621,8 @@ async def backup_status(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="backup_restore", description="Восстановить базу из копии")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     filename="Имя файла из /backup_status",
     confirmation="Введите ВОССТАНОВИТЬ",
@@ -2359,7 +2695,8 @@ async def find_manual_role_actor(member: discord.Member) -> int | None:
 
 @bot.tree.command(name="role_history", description="История ролей участника")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def role_history(
     interaction: discord.Interaction,
     member: discord.Member,

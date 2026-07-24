@@ -118,6 +118,19 @@ class StateStore:
                     due_at REAL NOT NULL,
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS wowaudit_loot_seen (
+                    loot_id INTEGER PRIMARY KEY,
+                    seen_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS raid_loot_reports (
+                    session_id INTEGER PRIMARY KEY,
+                    due_at REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    sent_at REAL,
+                    FOREIGN KEY (session_id) REFERENCES raid_sessions(id)
+                );
                 """
             )
             # Старые версии разрешали привязать одного персонажа нескольким
@@ -615,6 +628,67 @@ class StateStore:
                 (session_id,),
             )
 
+    def enqueue_raid_loot_report(self, session_id: int, due_at: float) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO raid_loot_reports(session_id, due_at)
+                VALUES (?, ?)
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (session_id, due_at),
+            )
+
+    def due_raid_loot_reports(self, now: float) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT
+                    rlr.session_id,
+                    rlr.due_at,
+                    rlr.attempts,
+                    rs.raid_date,
+                    rs.started_at,
+                    rs.ended_at
+                FROM raid_loot_reports rlr
+                JOIN raid_sessions rs ON rs.id=rlr.session_id
+                WHERE rlr.status='pending' AND rlr.due_at<=?
+                ORDER BY rlr.due_at, rlr.session_id
+                """,
+                (now,),
+            ).fetchall()
+
+    def fail_raid_loot_report(
+        self,
+        session_id: int,
+        error: str,
+        retry_at: float,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE raid_loot_reports
+                SET attempts=attempts + 1, last_error=?, due_at=?
+                WHERE session_id=? AND status='pending'
+                """,
+                (error, retry_at, session_id),
+            )
+
+    def complete_raid_loot_report(
+        self,
+        session_id: int,
+        sent_at: float,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE raid_loot_reports
+                SET status='sent', sent_at=?, last_error=''
+                WHERE session_id=?
+                """,
+                (sent_at, session_id),
+            )
+
     def set_absence(
         self, raid_date: str, member_id: int, reason: str, created_at: float
     ) -> None:
@@ -897,6 +971,28 @@ class StateStore:
                 (message_id,),
             )
 
+    def wowaudit_seen_loot_ids(self) -> set[int]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT loot_id FROM wowaudit_loot_seen"
+            ).fetchall()
+        return {int(row["loot_id"]) for row in rows}
+
+    def mark_wowaudit_loot_seen(
+        self, loot_ids: list[int], seen_at: float
+    ) -> None:
+        if not loot_ids:
+            return
+        with self._lock, self._connection:
+            self._connection.executemany(
+                """
+                INSERT INTO wowaudit_loot_seen(loot_id, seen_at)
+                VALUES (?, ?)
+                ON CONFLICT(loot_id) DO NOTHING
+                """,
+                [(loot_id, seen_at) for loot_id in loot_ids],
+            )
+
     def backup_to(self, destination: str | Path) -> None:
         destination_path = Path(destination)
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -948,6 +1044,8 @@ class StateStore:
             "raid_notices": "raid_notice_messages",
             "role_history": "role_history",
             "tactics_reminders": "tactics_reminders",
+            "wowaudit_loot_seen": "wowaudit_loot_seen",
+            "raid_loot_reports": "raid_loot_reports",
         }
         result: dict[str, int] = {}
         with self._lock:

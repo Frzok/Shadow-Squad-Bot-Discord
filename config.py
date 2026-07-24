@@ -35,6 +35,7 @@ RAID_VOICE_CHANNEL_ID = 713419816857370624
 RAID_ABSENCE_CHANNEL_ID = 1200807297111306280
 TACTICS_CHANNEL_ID = 1485886206817599569
 TACTICS_NOTIFICATION_CHANNEL_ID = 810474409755541524
+LOOT_HISTORY_CHANNEL_ID = 1505909442758184960
 RAID_NOTICE_EMOJI = "✅"
 ROSTER_URL = (
     "https://docs.google.com/spreadsheets/d/"
@@ -79,6 +80,9 @@ RAID_LATE_AFTER_MINUTES = 15
 RAID_MIN_ATTENDANCE_PERCENT = 60
 BACKUP_RETENTION_DAYS = 30
 TACTICS_REMINDER_DELAY_HOURS = 24
+WOWAUDIT_LOOT_CACHE_SECONDS = 120
+RAID_LOOT_REPORT_DELAY_MINUTES = 5
+RAID_LOOT_REPORT_RETRY_MINUTES = 5
 
 # Старые напоминания остаются доступными, но не запускаются без этих .env.
 REMINDER_CHANNEL_ID = _int_env("REMINDER_CHANNEL_ID")
@@ -94,6 +98,9 @@ BLIZZARD_REGION = os.getenv("BLIZZARD_REGION", "eu").lower()
 BLIZZARD_LOCALE = os.getenv("BLIZZARD_LOCALE", "ru_RU")
 BLIZZARD_REALM_SLUG = _blizzard_slug_env("BLIZZARD_REALM_SLUG")
 BLIZZARD_GUILD_SLUG = _blizzard_slug_env("BLIZZARD_GUILD_SLUG")
+
+# WoW Audit API для истории лута RCLootCouncil.
+WOWAUDIT_API_KEY = os.getenv("WOWAUDIT_API_KEY", "").strip()
 
 # Необязательная карта вида {"Discord ID": ["Персонаж", "Альт"]}.
 # Она имеет приоритет над сопоставлением по Discord-нику.
@@ -161,7 +168,10 @@ MESSAGES = {
         "(https://discord.com/channels/604571954422218752/1200807297111306280). "
         "Когда бот поставит под сообщением ✅, предупреждение будет учтено.\n\n"
         "Если твой привязанный персонаж играет в активной специализации "
-        "лекаря, бот дополнительно выдаст роль **Хила на крутилах**.\n\n"
+        "лекаря, бот дополнительно выдаст роль **Хила на крутилах**. "
+        "Если ты получил эту роль, хиловское обсуждение проходит в канале "
+        "[🙀крутилочная]"
+        "(https://discord.com/channels/604571954422218752/1279440882679939133).\n\n"
         "Все обращения по поводу изменения ролей, привязок персонажей "
         "или других данных необходимо направлять <@197371266007564289>."
     ),
