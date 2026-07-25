@@ -2392,6 +2392,166 @@ async def sync_member(
     )
 
 
+@bot.tree.command(
+    name="remove_guild_roles",
+    description="Немедленно снять управляемые гильдейские роли",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+@app_commands.describe(member="Участник Discord")
+async def remove_guild_roles(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    bot_member = interaction.guild.me
+    if bot_member is None or member.top_role >= bot_member.top_role:
+        await interaction.followup.send(
+            "Не удалось снять роли: роль участника находится выше или на одном "
+            "уровне с ролью бота.",
+            ephemeral=True,
+        )
+        return
+
+    managed_role_ids = {
+        *config.GUILD_RANK_ROLE_IDS.values(),
+        config.ROLE_IDS["HILA_NA_KRUTILAH"],
+    }
+    reason = (
+        "Немедленное ручное снятие гильдейских ролей командой "
+        f"{interaction.user} ({interaction.user.id})"
+    )
+
+    async with role_sync_lock:
+        roles_to_remove = [
+            role for role in member.roles if role.id in managed_role_ids
+        ]
+        if not roles_to_remove:
+            store.clear_absence(member.id)
+            await interaction.followup.send(
+                f"У {member.mention} нет управляемых гильдейских ролей.",
+                ephemeral=True,
+            )
+            return
+
+        for role in roles_to_remove:
+            suppress_role_event(member.id, role.id, "removed")
+        try:
+            await member.remove_roles(*roles_to_remove, reason=reason)
+        except (discord.Forbidden, discord.HTTPException) as error:
+            for role in roles_to_remove:
+                suppressed_role_events.pop(
+                    (member.id, role.id, "removed"),
+                    None,
+                )
+            logger.exception(
+                "Не удалось немедленно снять роли у %s",
+                member.id,
+            )
+            await interaction.followup.send(
+                f"Discord не позволил снять роли: {error}",
+                ephemeral=True,
+            )
+            return
+
+        for role in roles_to_remove:
+            store.add_role_history(
+                utc_timestamp(),
+                member.id,
+                role.id,
+                "removed",
+                "manual",
+                actor_id=interaction.user.id,
+                reason="Немедленное снятие без периода ожидания",
+            )
+        store.clear_absence(member.id)
+
+    await send_sync_log(
+        [
+            f"🛠️ {interaction.user.mention} вручную снял {role.mention} "
+            f"у {member.display_name} без периода ожидания."
+            for role in roles_to_remove
+        ]
+    )
+    await interaction.followup.send(
+        f"У {member.mention} немедленно сняты роли: "
+        + ", ".join(role.mention for role in roles_to_remove)
+        + ". Роли «Друзья» и «Гости» не затронуты.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="removal_queue",
+    description="Показать очередь снятия гильдейских ролей",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+async def removal_queue(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    rows = store.guild_absences()
+    if not rows:
+        await interaction.followup.send(
+            "Очередь снятия гильдейских ролей пуста.",
+            ephemeral=True,
+        )
+        return
+
+    managed_role_ids = {
+        *config.GUILD_RANK_ROLE_IDS.values(),
+        config.ROLE_IDS["HILA_NA_KRUTILAH"],
+    }
+    now = utc_timestamp()
+    grace_seconds = config.GUILD_ROLE_REMOVAL_GRACE_HOURS * 3600
+    lines = [
+        f"⏳ Очередь снятия ролей — {len(rows)} участник(а)",
+        (
+            f"Период ожидания: {config.GUILD_ROLE_REMOVAL_GRACE_HOURS} ч. "
+            "Для немедленного снятия используйте /remove_guild_roles."
+        ),
+    ]
+    for row in rows:
+        member_id = int(row["member_id"])
+        first_missing_at = float(row["first_missing_at"])
+        member = interaction.guild.get_member(member_id)
+        member_label = member.mention if member else f"Discord ID `{member_id}`"
+        started = datetime.fromtimestamp(
+            first_missing_at,
+            UTC,
+        ).astimezone(MSK)
+        remaining_seconds = max(
+            0,
+            int(grace_seconds - (now - first_missing_at)),
+        )
+        if remaining_seconds:
+            remaining_hours, remainder = divmod(remaining_seconds, 3600)
+            remaining_minutes = max(1, (remainder + 59) // 60)
+            remaining_label = (
+                f"осталось {remaining_hours} ч. {remaining_minutes} мин."
+            )
+        else:
+            remaining_label = "срок истёк — готов к снятию"
+
+        roles = (
+            [
+                role.mention
+                for role in member.roles
+                if role.id in managed_role_ids
+            ]
+            if member
+            else []
+        )
+        roles_label = ", ".join(roles) if roles else "управляемых ролей нет"
+        lines.append(
+            f"• {member_label} — с {started.strftime('%d.%m.%Y %H:%M')} МСК, "
+            f"{remaining_label}; роли: {roles_label}"
+        )
+
+    await send_ephemeral_chunks(interaction, lines)
+
+
 def frzok_mention(guild: discord.Guild) -> Optional[str]:
     if config.FRZOK_USER_ID:
         return f"<@{config.FRZOK_USER_ID}>"

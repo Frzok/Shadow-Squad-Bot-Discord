@@ -353,6 +353,16 @@ class StateStore:
                 "DELETE FROM guild_absences WHERE member_id=?", (member_id,)
             )
 
+    def guild_absences(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT member_id, first_missing_at
+                FROM guild_absences
+                ORDER BY first_missing_at, member_id
+                """
+            ).fetchall()
+
     def save_roster(
         self, characters: list[tuple[str, str, int]], fetched_at: float
     ) -> None:

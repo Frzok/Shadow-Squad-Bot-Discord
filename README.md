@@ -111,12 +111,21 @@ Discord-логине участника. Например, ник `Main | Ива
 | Гость | Гости | только `/roster` |
 | Участник | Летописец, Рекрут, Друзья | `/roster`, `/pidors_of_the_week`, `/absence`, `/attendance`, `/attendance_member`, `/loot_history`, `/loot_member` |
 | Рейдер | Сержант | все команды участника и `/pidor_of_the_day` |
-| Офицер | Знаменосец, RL | все команды рейдера, команды посещаемости, привязок и синхронизации, `/heroic`, `/rt_start`, `/bot_status`, `/role_history` |
+| Офицер | Знаменосец, RL | все команды рейдера, команды посещаемости, привязок и синхронизации, `/removal_queue`, `/remove_guild_roles`, `/heroic`, `/rt_start`, `/bot_status`, `/role_history` |
 | Администратор | право Discord «Администратор» | все команды, включая `/backup_status` и `/backup_restore` |
 
 К офицерским командам относятся `/attendance_start`, `/attendance_end`,
 `/attendance_current`, `/attendance_mark`, `/attendance_confirm`, `/link`,
-`/links`, `/unlink`, `/sync`, `/sync_member` и `/sync_status`.
+`/links`, `/unlink`, `/sync`, `/sync_member`, `/sync_status`,
+`/removal_queue` и `/remove_guild_roles`.
+
+`/remove_guild_roles @участник` немедленно снимает роли `RL`,
+`Знаменосец`, `Сержант`, `Летописец`, `Рекрут` и `Хила на крутилах`, не ожидая
+48 часов. Действие сохраняется в истории ролей и публикуется в служебном
+журнале. Ручные роли `Друзья` и `Гости` команда не изменяет.
+
+`/removal_queue` приватно показывает офицеру всех участников в 48-часовом
+ожидании, время начала, оставшийся срок и роли, которые будут сняты.
 
 Закрытые команды регистрируются как недоступные обычным пользователям по
 умолчанию, а бот независимо проверяет роль при выполнении. Чтобы Discord также
