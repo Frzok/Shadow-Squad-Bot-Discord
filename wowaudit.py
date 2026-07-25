@@ -1,4 +1,4 @@
-"""Асинхронный клиент WoW Audit для чтения истории лута."""
+"""Получение истории RCLootCouncil из WoW Audit."""
 
 from __future__ import annotations
 

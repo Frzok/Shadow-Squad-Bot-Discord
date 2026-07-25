@@ -1,4 +1,4 @@
-"""Минимальный клиент Battle.net API для чтения состава WoW-гильдии."""
+"""Запросы к Battle.net API: состав гильдии и профили персонажей."""
 
 from __future__ import annotations
 
@@ -54,8 +54,9 @@ class BlizzardClient:
             )
         )
 
+    @staticmethod
     def _request_json(
-        self, request: urllib.request.Request, timeout: int = 30
+        request: urllib.request.Request, timeout: int = 30
     ) -> dict:
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:

@@ -9,7 +9,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional, TypeVar, cast
 
 import discord
 from discord import app_commands
@@ -26,13 +26,24 @@ from warcraftlogs import (
 from wowaudit import LootHistoryItem, WoWAuditAPIError, WoWAuditClient
 
 
-if not hasattr(asyncio, "to_thread"):
-    async def _to_thread(function, /, *args, **kwargs):
-        loop = asyncio.get_running_loop()
-        call = functools.partial(function, *args, **kwargs)
-        return await loop.run_in_executor(None, call)
+ThreadResult = TypeVar("ThreadResult")
 
-    asyncio.to_thread = _to_thread
+
+if not hasattr(asyncio, "to_thread"):
+    async def _to_thread(
+        function: Callable[..., ThreadResult],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> ThreadResult:
+        loop = asyncio.get_running_loop()
+        run_in_executor = getattr(loop, "run_in_executor")
+        return await run_in_executor(
+            None,
+            lambda: function(*args, **kwargs),
+        )
+
+    setattr(asyncio, "to_thread", _to_thread)
 
 
 logging.basicConfig(
@@ -120,7 +131,7 @@ OFFICER_COMMAND_ROLE_IDS = frozenset(
 
 
 class RoleAccessDenied(app_commands.CheckFailure):
-    """Понятная пользователю ошибка проверки серверной роли."""
+    """Отказ в команде из-за Discord-роли."""
 
 
 def has_command_role(
@@ -160,6 +171,16 @@ def can_use_member_features(member: discord.Member) -> bool:
             config.GUEST_ROLE_ID not in role_ids
             and bool(role_ids & GUILD_MEMBER_COMMAND_ROLE_IDS)
         )
+    )
+
+
+def interaction_response(
+    interaction: discord.Interaction,
+) -> discord.InteractionResponse:
+    """Возвращает response с явным типом для статического анализа."""
+    return cast(
+        discord.InteractionResponse,
+        getattr(interaction, "response"),
     )
 
 
@@ -223,7 +244,7 @@ class GuildEventView(discord.ui.View):
         for label, style, action in actions:
             button = discord.ui.Button(
                 label=label,
-                style=style,
+                style=cast(discord.ButtonStyle, cast(object, style)),
                 custom_id=f"guild_event:{event_id}:{action}",
                 disabled=disabled,
             )
@@ -240,7 +261,7 @@ class GuildEventView(discord.ui.View):
     ) -> None:
         event = store.event(self.event_id)
         if not event or event["status"] != "open":
-            await interaction.response.send_message(
+            await interaction_response(interaction).send_message(
                 "Это событие уже закрыто.", ephemeral=True
             )
             return
@@ -248,7 +269,7 @@ class GuildEventView(discord.ui.View):
         if not isinstance(member, discord.Member) or not can_use_member_features(
             member
         ):
-            await interaction.response.send_message(
+            await interaction_response(interaction).send_message(
                 "У вас нет доступа к записи на события.", ephemeral=True
             )
             return
@@ -259,7 +280,7 @@ class GuildEventView(discord.ui.View):
                 or member.guild_permissions.administrator
                 or bool(role_ids & OFFICER_COMMAND_ROLE_IDS)
             ):
-                await interaction.response.send_message(
+                await interaction_response(interaction).send_message(
                     "Закрыть событие может организатор или офицер.",
                     ephemeral=True,
                 )
@@ -267,13 +288,13 @@ class GuildEventView(discord.ui.View):
             async with event_lock:
                 latest = store.event(self.event_id)
                 if not latest or latest["status"] != "open":
-                    await interaction.response.send_message(
+                    await interaction_response(interaction).send_message(
                         "Это событие уже закрыто.", ephemeral=True
                     )
                     return
                 store.close_event(self.event_id)
             closed_view = GuildEventView(self.event_id, disabled=True)
-            await interaction.response.edit_message(
+            await interaction_response(interaction).edit_message(
                 content=event_content(self.event_id),
                 view=closed_view,
             )
@@ -282,7 +303,7 @@ class GuildEventView(discord.ui.View):
         async with event_lock:
             event = store.event(self.event_id)
             if not event or event["status"] != "open":
-                await interaction.response.send_message(
+                await interaction_response(interaction).send_message(
                     "Это событие уже закрыто.", ephemeral=True
                 )
                 return
@@ -311,7 +332,7 @@ class GuildEventView(discord.ui.View):
                 final_action,
                 utc_timestamp(),
             )
-        await interaction.response.edit_message(
+        await interaction_response(interaction).edit_message(
             content=event_content(self.event_id),
             view=self,
         )
@@ -327,7 +348,7 @@ def utc_timestamp() -> float:
 
 
 def current_stats_period() -> str:
-    """Метка последней среды 05:00 МСК."""
+    """Начало текущей недели статистики: среда, 05:00 МСК."""
     now = datetime.now(MSK)
     days_since_wednesday = (now.weekday() - 2) % 7
     boundary = (now - timedelta(days=days_since_wednesday)).replace(
@@ -365,7 +386,7 @@ async def send_health_alert(
     *,
     cooldown_minutes: Optional[int] = None,
 ) -> bool:
-    """Отправляет frzok уведомление с постоянным ограничением повторов."""
+    """Пишет Frzok о сбое и не дублирует одинаковые сообщения."""
     cooldown = (
         cooldown_minutes
         if cooldown_minutes is not None
@@ -642,7 +663,6 @@ async def start_raid_attendance(
 
 
 async def finish_raid_attendance(
-    guild: discord.Guild,
     ended_at: Optional[float] = None,
 ) -> tuple[Optional[int], dict[str, int]]:
     async with attendance_lock:
@@ -737,7 +757,7 @@ async def reconcile_raid_attendance(guild: discord.Guild) -> None:
     if active:
         _, planned_end = raid_window(active["raid_date"])
         if now >= planned_end:
-            await finish_raid_attendance(guild, ended_at=planned_end.timestamp())
+            await finish_raid_attendance(ended_at=planned_end.timestamp())
         else:
             store.attendance_heartbeat(
                 int(active["id"]), raid_voice_member_ids(guild), utc_timestamp()
@@ -790,7 +810,7 @@ async def scheduled_attendance_end() -> None:
     if guild is None or now.weekday() not in (0, 5):
         return
     store.set_state("last_attendance_end_attempt", now.isoformat())
-    await finish_raid_attendance(guild)
+    await finish_raid_attendance()
 
 
 def backup_files() -> list[Path]:
@@ -927,7 +947,7 @@ def cached_guild_roster() -> tuple[list[GuildCharacter], Optional[float]]:
 
 
 async def fetch_guild_roster(force: bool = False) -> list[GuildCharacter]:
-    """Получает состав с кэшем, лимитом частоты и учётом ошибок API."""
+    """Возвращает свежий состав или последний рабочий кэш."""
     global last_roster_request_monotonic
 
     cached, fetched_at = cached_guild_roster()
@@ -1113,7 +1133,7 @@ async def member_healer_status(
 
 
 async def send_sync_log(lines: list[str]) -> None:
-    """Отправляет отчёт частями, не превышающими лимит Discord."""
+    """Разбивает длинный служебный отчёт на сообщения Discord."""
     if not lines:
         return
     channel = bot.get_channel(config.SYNC_LOG_CHANNEL_ID)
@@ -1381,7 +1401,7 @@ async def synchronize_guild_roles(
     async with role_sync_lock:
         try:
             roster = await fetch_guild_roster(force=member is None)
-        except BlizzardAPIError as error:
+        except BlizzardAPIError:
             logger.exception("Не удалось получить состав гильдии Blizzard")
             return False, 0, 0
 
@@ -1546,10 +1566,10 @@ async def on_app_command_error(
             exc_info=(type(error), error, error.__traceback__),
         )
         message = "При выполнении команды произошла ошибка. Подробности записаны в журнал."
-    if interaction.response.is_done():
+    if interaction_response(interaction).is_done():
         await interaction.followup.send(message, ephemeral=True)
     else:
-        await interaction.response.send_message(message, ephemeral=True)
+        await interaction_response(interaction).send_message(message, ephemeral=True)
 
 
 @bot.event
@@ -1610,7 +1630,7 @@ async def on_message(message: discord.Message) -> None:
 
 
 @bot.event
-async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+async def on_message_edit(_before: discord.Message, after: discord.Message) -> None:
     notice = store.raid_notice(after.id)
     if not notice or after.author.bot:
         return
@@ -2563,14 +2583,14 @@ async def pidor_of_the_day(interaction: discord.Interaction) -> None:
     async with pidor_lock:
         selected, is_new = select_pidor_for_today(interaction.guild)
         if selected is None:
-            await interaction.response.send_message(config.MESSAGES["NO_CANDIDATES"])
+            await interaction_response(interaction).send_message(config.MESSAGES["NO_CANDIDATES"])
             return
         if not is_new:
-            await interaction.response.send_message(
+            await interaction_response(interaction).send_message(
                 f"ВЖУХ И ТЫ ПИДОР: {selected.mention}"
             )
             return
-        await interaction.response.send_message("Что тут у нас?")
+        await interaction_response(interaction).send_message("Что тут у нас?")
         message = await interaction.original_response()
         await animate_pidor_message(message, selected)
 
@@ -2585,14 +2605,14 @@ async def pidor_of_the_day(interaction: discord.Interaction) -> None:
 async def pidors_of_the_week(interaction: discord.Interaction) -> None:
     stats = store.stats()
     if not stats:
-        await interaction.response.send_message(config.MESSAGES["NO_PIDORS"])
+        await interaction_response(interaction).send_message(config.MESSAGES["NO_PIDORS"])
         return
     lines = [config.MESSAGES["PIDORS_OF_THE_WEEK"]]
     for user_id, count in stats.items():
         member = interaction.guild.get_member(user_id)
         label = member.display_name if member else f"Участник {user_id}"
         lines.append(f"{label}: {count} раз(а)")
-    await interaction.response.send_message("\n".join(lines))
+    await interaction_response(interaction).send_message("\n".join(lines))
 
 
 async def send_ephemeral_chunks(
@@ -2645,34 +2665,34 @@ async def absence(
     try:
         parsed = parse_raid_date(raid_date)
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
     if parsed.weekday() not in (4, 6):
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Основные РТ проходят только по пятницам и воскресеньям.",
             ephemeral=True,
         )
         return
     cleaned_reason = reason.strip()
     if not cleaned_reason:
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Укажите причину предупреждения.", ephemeral=True
         )
         return
     arrival = arrival_time.strip() if arrival_time else ""
     if arrival and notice_type.value != "late":
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Время прихода можно указывать только для типа «Опоздаю».",
             ephemeral=True,
         )
         return
     if arrival and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", arrival):
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Время прихода должно быть в формате ЧЧ:ММ, например 21:30.",
             ephemeral=True,
         )
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     channel = bot.get_channel(config.RAID_ABSENCE_CHANNEL_ID)
     if channel is None or not hasattr(channel, "send"):
         await interaction.followup.send(
@@ -2731,7 +2751,7 @@ async def absence_list(
     try:
         parsed = parse_raid_date(raid_date)
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
     absences = store.absences_for_date(parsed.date().isoformat())
     lines = [f"📋 Предупреждения на {parsed.strftime('%d.%m.%Y')}"]
@@ -2741,7 +2761,7 @@ async def absence_list(
         lines.append(f"• {label} — {reason}")
     if not absences:
         lines.append("Предупреждений нет.")
-    await interaction.response.send_message(
+    await interaction_response(interaction).send_message(
         "\n".join(lines), ephemeral=True
     )
 
@@ -2763,17 +2783,17 @@ async def absence_cancel(
     try:
         parsed = parse_raid_date(raid_date)
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
     date_key = parsed.date().isoformat()
     existing = store.absences_for_date(date_key).get(interaction.user.id)
     if existing is None:
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             f"Предупреждение на {parsed.strftime('%d.%m.%Y')} не найдено.",
             ephemeral=True,
         )
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     notices = store.cancel_member_absence(date_key, interaction.user.id)
     for notice in notices:
         channel = bot.get_channel(int(notice["channel_id"]))
@@ -2807,7 +2827,7 @@ async def attendance_start(
         try:
             parsed = parse_raid_date(raid_date)
         except ValueError as error:
-            await interaction.response.send_message(str(error), ephemeral=True)
+            await interaction_response(interaction).send_message(str(error), ephemeral=True)
             return
         date_key = parsed.date().isoformat()
         start_at = parsed.replace(hour=21, minute=0).timestamp()
@@ -2819,9 +2839,9 @@ async def attendance_start(
             interaction.guild, date_key, start_at
         )
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
-    await interaction.response.send_message(
+    await interaction_response(interaction).send_message(
         (
             f"Учёт посещаемости начат, сессия #{session_id}."
             if created
@@ -2836,8 +2856,8 @@ async def attendance_start(
 @app_commands.default_permissions()
 @has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def attendance_end(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True)
-    session_id, counts = await finish_raid_attendance(interaction.guild)
+    await interaction_response(interaction).defer(ephemeral=True)
+    session_id, counts = await finish_raid_attendance()
     if session_id is None:
         await interaction.followup.send("Активной РТ-сессии нет.", ephemeral=True)
         return
@@ -2853,7 +2873,7 @@ async def attendance_end(interaction: discord.Interaction) -> None:
 @app_commands.default_permissions()
 @has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def attendance_current(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     session = store.active_raid_session() or store.latest_raid_session()
     if not session:
         await interaction.followup.send("РТ-сессий пока нет.", ephemeral=True)
@@ -2899,7 +2919,7 @@ async def attendance_mark(
 ) -> None:
     session = store.latest_raid_session()
     if not session or session["status"] not in ("active", "draft"):
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Нет активной сессии или черновика для исправления.", ephemeral=True
         )
         return
@@ -2910,7 +2930,7 @@ async def attendance_mark(
         note.strip(),
         source="manual",
     )
-    await interaction.response.send_message(
+    await interaction_response(interaction).send_message(
         f"{member.mention}: установлен статус "
         f"«{ATTENDANCE_STATUS_LABELS[status.value]}».",
         ephemeral=True,
@@ -2924,12 +2944,12 @@ async def attendance_mark(
 async def attendance_confirm(interaction: discord.Interaction) -> None:
     session = store.latest_raid_session()
     if not session or session["status"] != "draft":
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Нет черновика, ожидающего подтверждения.", ephemeral=True
         )
         return
     store.confirm_raid_session(int(session["id"]))
-    await interaction.response.send_message(
+    await interaction_response(interaction).send_message(
         f"Посещаемость сессии #{session['id']} подтверждена.",
         ephemeral=True,
     )
@@ -2998,9 +3018,9 @@ async def attendance(
     try:
         month_key = validate_month(month)
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     lines = [f"📅 Посещаемость за {month_key}"]
     lines.extend(attendance_summary(store.monthly_attendance(month_key), interaction.guild))
     await send_ephemeral_chunks(interaction, lines)
@@ -3022,9 +3042,9 @@ async def attendance_member(
     try:
         month_key = validate_month(month)
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     rows = store.monthly_attendance(month_key)
     summary = attendance_summary(rows, interaction.guild, member.id)
     lines = [f"📅 {member.display_name}, {month_key}"]
@@ -3055,9 +3075,9 @@ async def monthly_report(
     try:
         month_key = validate_month(month)
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     rows = store.monthly_attendance(month_key)
     raid_dates = sorted({str(row["raid_date"]) for row in rows})
     status_counts = {
@@ -3107,12 +3127,12 @@ async def link_characters(
     }
     names = list(names_by_key.values())
     if not names:
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Укажите хотя бы одного персонажа.", ephemeral=True
         )
         return
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     try:
         roster = await fetch_guild_roster()
     except BlizzardAPIError:
@@ -3174,7 +3194,7 @@ async def links(
     interaction: discord.Interaction,
     member: Optional[discord.Member] = None,
 ) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     grouped: dict[int, set[str]] = {}
     for member_id, names in config.DISCORD_CHARACTER_LINKS.items():
         grouped.setdefault(member_id, set()).update(names)
@@ -3195,7 +3215,8 @@ async def links(
     for member_id, names in sorted(grouped.items()):
         guild_member = interaction.guild.get_member(member_id)
         label = guild_member.mention if guild_member else f"ID {member_id}"
-        lines.append(f"{label}: {', '.join(sorted(names, key=str.casefold))}")
+        sorted_names = sorted(names, key=lambda name: name.casefold())
+        lines.append(f"{label}: {', '.join(sorted_names)}")
 
     chunks: list[str] = []
     current = ""
@@ -3231,7 +3252,7 @@ async def unlink(
         normalize_character_name(name) == normalize_character_name(character)
         for name in configured_names
     ):
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Эта привязка задана через DISCORD_CHARACTER_LINKS в .env. "
             "Удалите её из .env и перезапустите бота.",
             ephemeral=True,
@@ -3249,7 +3270,7 @@ async def unlink(
         message = "Подходящая локальная привязка не найдена."
     if not character and configured_names:
         message += " Привязки из .env сохранены."
-    await interaction.response.send_message(message, ephemeral=True)
+    await interaction_response(interaction).send_message(message, ephemeral=True)
 
 
 @bot.tree.command(name="sync_status", description="Состояние синхронизации Blizzard")
@@ -3260,7 +3281,7 @@ async def sync_status(interaction: discord.Interaction) -> None:
     last_error = store.get_state("last_api_error") or "нет"
     last_error_at = format_msk_timestamp(store.get_state("last_api_error_at"))
     next_sync = next_role_sync_time().strftime("%d.%m.%Y %H:%M:%S МСК")
-    await interaction.response.send_message(
+    await interaction_response(interaction).send_message(
         "\n".join(
             (
                 "🔄 Состояние синхронизации",
@@ -3382,7 +3403,7 @@ async def role_audit(
     interaction: discord.Interaction,
     member: Optional[discord.Member] = None,
 ) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     try:
         roster = await fetch_guild_roster()
     except BlizzardAPIError:
@@ -3425,7 +3446,7 @@ async def role_audit(
 @app_commands.default_permissions()
 @has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def sync_roles(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     success, roster_size, changed = await synchronize_guild_roles()
     if not success:
         await interaction.followup.send(
@@ -3452,7 +3473,7 @@ async def sync_member(
     interaction: discord.Interaction,
     member: discord.Member,
 ) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     success, roster_size, changed = await synchronize_guild_roles(member)
     if not success:
         await interaction.followup.send(
@@ -3479,7 +3500,7 @@ async def remove_guild_roles(
     interaction: discord.Interaction,
     member: discord.Member,
 ) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     bot_member = interaction.guild.me
     if bot_member is None or member.top_role >= bot_member.top_role:
         await interaction.followup.send(
@@ -3565,7 +3586,7 @@ async def remove_guild_roles(
 @app_commands.default_permissions()
 @has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def removal_queue(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     rows = store.guild_absences()
     if not rows:
         await interaction.followup.send(
@@ -3669,7 +3690,7 @@ async def create_event(
         utc_timestamp(),
     )
     view = GuildEventView(event_id)
-    await interaction.response.send_message(
+    await interaction_response(interaction).send_message(
         event_content(event_id),
         view=view,
         allowed_mentions=discord.AllowedMentions(
@@ -3717,7 +3738,7 @@ async def publish_raid_announcement(
 @app_commands.default_permissions()
 @has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def heroic(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     mention = frzok_mention(interaction.guild)
     if mention is None:
         await interaction.followup.send(
@@ -3740,7 +3761,7 @@ async def heroic(interaction: discord.Interaction) -> None:
 @app_commands.default_permissions()
 @has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
 async def rt_start(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     mention = frzok_mention(interaction.guild)
     if mention is None:
         await interaction.followup.send(
@@ -3758,7 +3779,7 @@ async def rt_start(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="roster", description="Показать таблицу состава")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
 async def roster_link(interaction: discord.Interaction) -> None:
-    await interaction.response.send_message(config.ROSTER_URL, ephemeral=True)
+    await interaction_response(interaction).send_message(config.ROSTER_URL, ephemeral=True)
 
 
 @bot.tree.command(name="loot_history", description="Последние предметы из WoW Audit")
@@ -3774,12 +3795,12 @@ async def loot_history(
     limit: app_commands.Range[int, 1, 25] = 10,
 ) -> None:
     if not wowaudit.configured:
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "История лута не настроена: отсутствует WOWAUDIT_API_KEY.",
             ephemeral=True,
         )
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     try:
         season_name, items = await fetch_wowaudit_loot()
     except WoWAuditAPIError as error:
@@ -3816,12 +3837,12 @@ async def loot_member(
     limit: app_commands.Range[int, 1, 25] = 10,
 ) -> None:
     if not wowaudit.configured:
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "История лута не настроена: отсутствует WOWAUDIT_API_KEY.",
             ephemeral=True,
         )
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     try:
         season_name, items = await fetch_wowaudit_loot()
     except WoWAuditAPIError as error:
@@ -3869,9 +3890,9 @@ async def logs_member(
     try:
         parsed = parse_raid_date(raid_date)
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     try:
         report = await warcraftlogs_report_for_date(parsed)
     except WarcraftLogsAPIError as error:
@@ -3960,9 +3981,9 @@ async def logs_deaths(
     try:
         parsed = parse_raid_date(raid_date)
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     try:
         report = await warcraftlogs_report_for_date(parsed)
     except WarcraftLogsAPIError as error:
@@ -4004,17 +4025,17 @@ async def logs_report(
     raid_date: str,
 ) -> None:
     if not warcraftlogs.configured:
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Warcraft Logs API не настроен.", ephemeral=True
         )
         return
     try:
         parsed = parse_raid_date(raid_date)
     except ValueError as error:
-        await interaction.response.send_message(str(error), ephemeral=True)
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     try:
         report = await warcraftlogs_report_for_date(parsed)
     except WarcraftLogsAPIError as error:
@@ -4102,7 +4123,7 @@ async def bot_status(interaction: discord.Interaction) -> None:
             scheduled_database_backup,
         )
     )
-    await interaction.response.send_message(
+    await interaction_response(interaction).send_message(
         "\n".join(
             (
                 "🩺 Состояние бота",
@@ -4156,7 +4177,7 @@ async def bot_status(interaction: discord.Interaction) -> None:
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def backup_status(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     files = backup_files()
     now = datetime.now(MSK)
     next_backup = now.replace(hour=4, minute=30, second=0, microsecond=0)
@@ -4201,7 +4222,7 @@ async def backup_restore(
     confirmation: str,
 ) -> None:
     if confirmation != "ВОССТАНОВИТЬ":
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Восстановление отменено: неверное подтверждение.", ephemeral=True
         )
         return
@@ -4212,11 +4233,11 @@ async def backup_restore(
         or candidate.suffix != ".sqlite3"
         or not candidate.is_file()
     ):
-        await interaction.response.send_message(
+        await interaction_response(interaction).send_message(
             "Указанный файл резервной копии не найден.", ephemeral=True
         )
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
     healthy = await asyncio.to_thread(StateStore.validate_database, candidate)
     if not healthy:
         await interaction.followup.send(
@@ -4248,7 +4269,13 @@ async def find_manual_role_actor(member: discord.Member) -> Optional[int]:
     try:
         async for entry in member.guild.audit_logs(
             limit=6,
-            action=discord.AuditLogAction.member_role_update,
+            action=cast(
+                discord.AuditLogAction,
+                cast(
+                    object,
+                    discord.AuditLogAction.member_role_update,
+                ),
+            ),
         ):
             target = entry.target
             if getattr(target, "id", None) != member.id:
@@ -4269,7 +4296,7 @@ async def role_history(
     interaction: discord.Interaction,
     member: discord.Member,
 ) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction_response(interaction).defer(ephemeral=True)
     rows = store.member_role_history(member.id)
     if not rows:
         await interaction.followup.send(

@@ -1,8 +1,7 @@
-"""Настройки бота.
+"""Настройки Shadow Squad Bot.
 
-Секреты и параметры Blizzard читаются из .env. Discord ID этого сервера
-зафиксированы здесь намеренно: это предотвращает случайный запуск на другом
-сервере с неверными ролями.
+Секреты берутся из .env, а Discord ID оставлены в коде: эта сборка работает
+только на сервере Shadow Squad.
 """
 
 from __future__ import annotations
@@ -36,10 +35,10 @@ def _int_set_env(name: str) -> set[int]:
             for item in re.split(r"[\s,;]+", value.strip())
             if item
         }
-    except ValueError as error:
+    except ValueError as conversion_error:
         raise RuntimeError(
             f"{name} должен содержать Discord ID через запятую"
-        ) from error
+        ) from conversion_error
 
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
@@ -53,6 +52,7 @@ TACTICS_CHANNEL_ID = 1485886206817599569
 TACTICS_NOTIFICATION_CHANNEL_ID = 810474409755541524
 LOOT_HISTORY_CHANNEL_ID = 1505909442758184960
 RAID_NOTICE_EMOJI = "✅"
+# noinspection SpellCheckingInspection
 ROSTER_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1NEyoAcgQEa2BUyNZGwpoO1FRGgpjhHPSauEPqe1BZIw/"
@@ -155,8 +155,10 @@ try:
             os.getenv("DISCORD_CHARACTER_LINKS", "{}")
         ).items()
     }
-except (ValueError, TypeError, json.JSONDecodeError) as error:
-    raise RuntimeError("Некорректный JSON в DISCORD_CHARACTER_LINKS") from error
+except (ValueError, TypeError, json.JSONDecodeError) as links_json_error:
+    raise RuntimeError(
+        "Некорректный JSON в DISCORD_CHARACTER_LINKS"
+    ) from links_json_error
 
 _configured_character_owners: dict[str, int] = {}
 for _discord_id, _character_names in DISCORD_CHARACTER_LINKS.items():
