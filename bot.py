@@ -18,6 +18,11 @@ from discord.ext import commands, tasks
 import config
 from blizzard import BlizzardAPIError, BlizzardClient, GuildCharacter
 from storage import StateStore
+from warcraftlogs import (
+    WarcraftLogsAPIError,
+    WarcraftLogsClient,
+    WarcraftLogsReport,
+)
 from wowaudit import LootHistoryItem, WoWAuditAPIError, WoWAuditClient
 
 
@@ -56,6 +61,13 @@ blizzard = BlizzardClient(
     config.BLIZZARD_GUILD_SLUG,
 )
 wowaudit = WoWAuditClient(config.WOWAUDIT_API_KEY)
+warcraftlogs = WarcraftLogsClient(
+    config.WARCRAFTLOGS_CLIENT_ID,
+    config.WARCRAFTLOGS_CLIENT_SECRET,
+    config.WARCRAFTLOGS_GUILD_NAME,
+    config.WARCRAFTLOGS_SERVER_SLUG,
+    config.WARCRAFTLOGS_REGION,
+)
 startup_complete = False
 role_sync_lock = asyncio.Lock()
 roster_fetch_lock = asyncio.Lock()
@@ -69,6 +81,8 @@ wowaudit_loot_cache: Optional[tuple[str, list[LootHistoryItem]]] = None
 specialization_role_cache: dict[int, str] = {}
 suppressed_role_events: dict[tuple[int, int, str], float] = {}
 PROCESS_STARTED_AT = datetime.now(MSK)
+health_alert_lock = asyncio.Lock()
+event_lock = asyncio.Lock()
 
 ATTENDANCE_STATUS_LABELS = {
     "present": "Присутствовал",
@@ -129,6 +143,185 @@ def has_command_role(
     return app_commands.check(predicate)
 
 
+EVENT_TYPE_LABELS = {
+    "key": "🔑 Ключи",
+    "heroic": "⚔️ Героик",
+    "achievement": "🏆 Достижения",
+    "legacy": "🕰️ Старый контент",
+    "other": "🎮 Другое",
+}
+
+
+def can_use_member_features(member: discord.Member) -> bool:
+    role_ids = {role.id for role in member.roles}
+    return (
+        member.guild_permissions.administrator
+        or (
+            config.GUEST_ROLE_ID not in role_ids
+            and bool(role_ids & GUILD_MEMBER_COMMAND_ROLE_IDS)
+        )
+    )
+
+
+def format_event_members(member_mentions: list[str], limit: int = 30) -> str:
+    if not member_mentions:
+        return "пока никого"
+    visible = ", ".join(member_mentions[:limit])
+    hidden = len(member_mentions) - limit
+    return f"{visible} (+ ещё {hidden})" if hidden > 0 else visible
+
+
+def event_content(event_id: int) -> str:
+    event = store.event(event_id)
+    if not event:
+        return "Событие не найдено."
+    participants = store.event_participants(event_id)
+    going = [
+        f"<@{row['member_id']}>"
+        for row in participants
+        if row["status"] == "going"
+    ]
+    reserve = [
+        f"<@{row['member_id']}>"
+        for row in participants
+        if row["status"] == "reserve"
+    ]
+    limit = int(event["max_participants"])
+    slots = f"/{limit}" if limit else ""
+    lines = [
+        f"## {EVENT_TYPE_LABELS.get(event['event_type'], '🎮 Событие')} — "
+        f"{event['title']}",
+        f"📅 **Когда:** {event['scheduled_for']}",
+        f"👤 **Организатор:** <@{event['creator_id']}>",
+    ]
+    if event["description"]:
+        lines.append(f"📝 {event['description']}")
+    lines.extend(
+        (
+            "",
+            f"✅ **Участвуют ({len(going)}{slots}):** "
+            + format_event_members(going),
+            f"🟡 **Резерв ({len(reserve)}):** "
+            + format_event_members(reserve),
+        )
+    )
+    if event["status"] != "open":
+        lines.extend(("", "🔒 **Набор закрыт.**"))
+    return "\n".join(lines)
+
+
+class GuildEventView(discord.ui.View):
+    def __init__(self, event_id: int, disabled: bool = False) -> None:
+        super().__init__(timeout=None)
+        self.event_id = event_id
+        actions = (
+            ("Участвую", discord.ButtonStyle.success, "going"),
+            ("Резерв", discord.ButtonStyle.primary, "reserve"),
+            ("Отказаться", discord.ButtonStyle.secondary, "removed"),
+            ("Закрыть", discord.ButtonStyle.danger, "close"),
+        )
+        for label, style, action in actions:
+            button = discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=f"guild_event:{event_id}:{action}",
+                disabled=disabled,
+            )
+            button.callback = functools.partial(
+                self._handle_action, action=action
+            )
+            self.add_item(button)
+
+    async def _handle_action(
+        self,
+        interaction: discord.Interaction,
+        *,
+        action: str,
+    ) -> None:
+        event = store.event(self.event_id)
+        if not event or event["status"] != "open":
+            await interaction.response.send_message(
+                "Это событие уже закрыто.", ephemeral=True
+            )
+            return
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not can_use_member_features(
+            member
+        ):
+            await interaction.response.send_message(
+                "У вас нет доступа к записи на события.", ephemeral=True
+            )
+            return
+        if action == "close":
+            role_ids = {role.id for role in member.roles}
+            if not (
+                member.id == int(event["creator_id"])
+                or member.guild_permissions.administrator
+                or bool(role_ids & OFFICER_COMMAND_ROLE_IDS)
+            ):
+                await interaction.response.send_message(
+                    "Закрыть событие может организатор или офицер.",
+                    ephemeral=True,
+                )
+                return
+            async with event_lock:
+                latest = store.event(self.event_id)
+                if not latest or latest["status"] != "open":
+                    await interaction.response.send_message(
+                        "Это событие уже закрыто.", ephemeral=True
+                    )
+                    return
+                store.close_event(self.event_id)
+            closed_view = GuildEventView(self.event_id, disabled=True)
+            await interaction.response.edit_message(
+                content=event_content(self.event_id),
+                view=closed_view,
+            )
+            return
+
+        async with event_lock:
+            event = store.event(self.event_id)
+            if not event or event["status"] != "open":
+                await interaction.response.send_message(
+                    "Это событие уже закрыто.", ephemeral=True
+                )
+                return
+            final_action = action
+            if action == "going" and int(event["max_participants"]):
+                participants = store.event_participants(self.event_id)
+                current = next(
+                    (
+                        row
+                        for row in participants
+                        if int(row["member_id"]) == member.id
+                    ),
+                    None,
+                )
+                going_count = sum(
+                    row["status"] == "going" for row in participants
+                )
+                if (
+                    going_count >= int(event["max_participants"])
+                    and (not current or current["status"] != "going")
+                ):
+                    final_action = "reserve"
+            store.set_event_participant(
+                self.event_id,
+                member.id,
+                final_action,
+                utc_timestamp(),
+            )
+        await interaction.response.edit_message(
+            content=event_content(self.event_id),
+            view=self,
+        )
+        if final_action == "reserve" and action == "going":
+            await interaction.followup.send(
+                "Основной состав заполнен — вы добавлены в резерв.",
+                ephemeral=True,
+            )
+
+
 def utc_timestamp() -> float:
     return datetime.now(UTC).timestamp()
 
@@ -164,6 +357,63 @@ def format_msk_timestamp(value: Optional[str]) -> str:
         return parsed.astimezone(MSK).strftime("%d.%m.%Y %H:%M:%S МСК")
     except ValueError:
         return value
+
+
+async def send_health_alert(
+    key: str,
+    message: str,
+    *,
+    cooldown_minutes: Optional[int] = None,
+) -> bool:
+    """Отправляет frzok уведомление с постоянным ограничением повторов."""
+    cooldown = (
+        cooldown_minutes
+        if cooldown_minutes is not None
+        else config.HEALTH_ALERT_COOLDOWN_MINUTES
+    )
+    async with health_alert_lock:
+        state_key = f"health_alert:{key}"
+        previous = store.get_state(state_key)
+        if previous:
+            try:
+                previous_at = datetime.fromisoformat(previous)
+                if datetime.now(MSK) - previous_at < timedelta(minutes=cooldown):
+                    return False
+            except ValueError:
+                pass
+
+        content = f"<@{config.FRZOK_USER_ID}> {message}"
+        channel = bot.get_channel(config.HEALTH_ALERT_CHANNEL_ID)
+        sent = False
+        if channel is not None and hasattr(channel, "send"):
+            try:
+                await channel.send(content)
+                sent = True
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("Не удалось отправить системное уведомление")
+        if not sent:
+            user = bot.get_user(config.FRZOK_USER_ID)
+            if user:
+                try:
+                    await user.send(message)
+                    sent = True
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception(
+                        "Не удалось отправить системное уведомление в ЛС"
+                    )
+        if sent:
+            store.set_state(state_key, datetime.now(MSK).isoformat())
+        return sent
+
+
+def state_timestamp(key: str) -> Optional[datetime]:
+    value = store.get_state(key)
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).astimezone(MSK)
+    except ValueError:
+        return None
 
 
 def next_role_sync_time(now: Optional[datetime] = None) -> datetime:
@@ -460,6 +710,11 @@ async def finish_raid_attendance(
             max(end_timestamp, utc_timestamp())
             + config.RAID_LOOT_REPORT_DELAY_MINUTES * 60,
         )
+        store.enqueue_warcraftlogs_report(
+            session_id,
+            max(end_timestamp, utc_timestamp())
+            + config.WARCRAFTLOGS_REPORT_DELAY_MINUTES * 60,
+        )
         announcement_channel = bot.get_channel(config.RAID_ANNOUNCEMENT_CHANNEL_ID)
         if announcement_channel and hasattr(announcement_channel, "send"):
             await announcement_channel.send(
@@ -517,6 +772,7 @@ async def scheduled_attendance_start() -> None:
     guild = bot.get_guild(config.GUILD_ID)
     if guild is None or now.weekday() not in (4, 6):
         return
+    store.set_state("last_attendance_start_attempt", now.isoformat())
     try:
         await start_raid_attendance(
             guild,
@@ -533,6 +789,7 @@ async def scheduled_attendance_end() -> None:
     guild = bot.get_guild(config.GUILD_ID)
     if guild is None or now.weekday() not in (0, 5):
         return
+    store.set_state("last_attendance_end_attempt", now.isoformat())
     await finish_raid_attendance(guild)
 
 
@@ -568,6 +825,9 @@ def create_database_backup(label: str = "daily") -> Path:
 async def scheduled_database_backup() -> None:
     try:
         backup = await asyncio.to_thread(create_database_backup, "daily")
+        store.set_state(
+            "last_backup_success", datetime.now(MSK).isoformat()
+        )
         logger.info("Создана резервная копия %s", backup.name)
     except (OSError, sqlite3.Error):
         logger.exception("Не удалось создать ежедневную резервную копию")
@@ -597,13 +857,22 @@ async def fetch_wowaudit_loot(
         try:
             result = await wowaudit.loot_history()
         except WoWAuditAPIError as error:
+            failures = parse_state_int("wowaudit_failure_count") + 1
+            store.set_state("wowaudit_failure_count", str(failures))
             store.set_state("last_wowaudit_error", str(error))
             store.set_state("last_wowaudit_error_at", datetime.now(MSK).isoformat())
+            if failures >= config.BLIZZARD_API_FAILURE_ALERT_THRESHOLD:
+                await send_health_alert(
+                    "wowaudit_api",
+                    "⚠️ WoW Audit API недоступен "
+                    f"{failures} раз подряд: `{str(error)[:500]}`",
+                )
             raise
         wowaudit_loot_cache = result
         last_wowaudit_fetch_at = time.monotonic()
         store.set_state("last_wowaudit_success", datetime.now(MSK).isoformat())
         store.set_state("last_wowaudit_error", "")
+        store.set_state("wowaudit_failure_count", "0")
         return result
 
 
@@ -705,6 +974,11 @@ async def fetch_guild_roster(force: bool = False) -> list[GuildCharacter]:
                     "Blizzard API недоступен уже %s раз подряд: %s",
                     failures,
                     error,
+                )
+                await send_health_alert(
+                    "blizzard_api",
+                    "⚠️ Blizzard API недоступен "
+                    f"{failures} раз подряд: `{str(error)[:500]}`",
                 )
             raise
 
@@ -1205,6 +1479,11 @@ async def on_ready() -> None:
     await reconcile_persistent_state(guild)
     await reconcile_raid_notice_reactions()
     await reconcile_raid_attendance(guild)
+    for event in store.open_events():
+        bot.add_view(
+            GuildEventView(int(event["id"])),
+            message_id=int(event["message_id"]),
+        )
     if not backup_files():
         try:
             await asyncio.to_thread(create_database_backup, "initial")
@@ -1224,10 +1503,12 @@ async def on_ready() -> None:
         check_empty_channels,
         check_tactics_reminders,
         check_raid_loot_reports,
+        check_warcraftlogs_reports,
         scheduled_raid_reminder,
         reset_weekly_stats,
         scheduled_role_sync,
         scheduled_pidor_of_the_day,
+        scheduled_health_check,
         attendance_heartbeat,
         scheduled_attendance_start,
         scheduled_attendance_end,
@@ -1236,6 +1517,12 @@ async def on_ready() -> None:
         if not loop.is_running():
             loop.start()
     startup_complete = True
+    await send_health_alert(
+        f"restart:{PROCESS_STARTED_AT.isoformat()}",
+        "🔄 Бот запущен или перезапущен. "
+        f"Время запуска: **{PROCESS_STARTED_AT.strftime('%d.%m.%Y %H:%M:%S')} МСК**.",
+        cooldown_minutes=0,
+    )
 
 
 @bot.tree.error
@@ -1563,6 +1850,182 @@ async def check_raid_loot_reports() -> None:
             )
 
 
+def warcraftlogs_report_lines(report: WarcraftLogsReport, raid_date: str) -> list[str]:
+    boss_fights = [
+        fight
+        for fight in report.fights
+        if int(fight.get("encounterID") or 0) > 0
+    ]
+    kills = [fight for fight in boss_fights if fight.get("kill")]
+    participants = report.participants
+    deaths = sorted(
+        report.deaths.items(),
+        key=lambda item: (-item[1], item[0].casefold()),
+    )
+    best = WarcraftLogsClient.best_rankings(report.rankings)
+    lines = [
+        f"📈 **Warcraft Logs за РТ {raid_date}**",
+        f"**{report.title}**"
+        + (f" · {report.zone_name}" if report.zone_name else ""),
+        f"Боссы: **{len(kills)} убийств / {len(boss_fights)} пуллов**",
+        f"Участники ({len(participants)}): "
+        + (", ".join(participants) if participants else "данные отсутствуют"),
+    ]
+    if deaths:
+        lines.append(
+            "Смерти (только первые 2 в каждом пуле): "
+            + ", ".join(
+                f"**{name}** — {amount}" for name, amount in deaths[:15]
+            )
+        )
+    else:
+        lines.append("Смерти: не найдены или недоступны.")
+    if best:
+        lines.append(
+            "Лучшие результаты: "
+            + ", ".join(
+                f"**{name}** — {percent:.1f}%"
+                for name, percent in best
+            )
+        )
+    elif kills:
+        fastest = min(
+            kills,
+            key=lambda fight: float(fight.get("endTime") or 0)
+            - float(fight.get("startTime") or 0),
+        )
+        duration = max(
+            0,
+            int(
+                (
+                    float(fastest.get("endTime") or 0)
+                    - float(fastest.get("startTime") or 0)
+                )
+                / 1000
+            ),
+        )
+        lines.append(
+            f"Лучший результат: самое быстрое убийство — "
+            f"**{fastest.get('name', 'босс')}**, "
+            f"{duration // 60}:{duration % 60:02d}."
+        )
+    lines.append(f"🔗 [Открыть полный отчёт]({report.url})")
+    return lines
+
+
+async def send_channel_chunks(channel, lines: list[str]) -> None:
+    current = ""
+    for line in lines:
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > 1900 and current:
+            await channel.send(
+                current,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            current = line
+        else:
+            current = candidate
+    if current:
+        await channel.send(
+            current,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+@tasks.loop(minutes=config.WARCRAFTLOGS_REPORT_RETRY_MINUTES)
+async def check_warcraftlogs_reports() -> None:
+    if not warcraftlogs.configured:
+        return
+    guild = bot.get_guild(config.GUILD_ID)
+    if guild is None:
+        return
+    channel = guild.get_channel(config.WARCRAFTLOGS_REPORT_CHANNEL_ID)
+    if channel is None or not hasattr(channel, "send"):
+        await send_health_alert(
+            "warcraftlogs_channel",
+            "⚠️ Канал отчётов Warcraft Logs "
+            f"`{config.WARCRAFTLOGS_REPORT_CHANNEL_ID}` не найден.",
+        )
+        return
+
+    for queued in store.due_warcraftlogs_reports(utc_timestamp()):
+        session_id = int(queued["session_id"])
+        ended_at = float(queued["ended_at"] or utc_timestamp())
+        age = utc_timestamp() - ended_at
+        try:
+            report = await warcraftlogs.latest_report(
+                float(queued["started_at"]) - 3600,
+                ended_at + 2 * 3600,
+            )
+            if report is None:
+                abandon = (
+                    age
+                    >= config.WARCRAFTLOGS_REPORT_MAX_AGE_HOURS * 3600
+                )
+                store.fail_warcraftlogs_report(
+                    session_id,
+                    "Подходящий публичный лог пока не найден",
+                    utc_timestamp()
+                    + config.WARCRAFTLOGS_REPORT_RETRY_MINUTES * 60,
+                    abandon=abandon,
+                )
+                if abandon:
+                    await send_health_alert(
+                        f"warcraftlogs_missing:{session_id}",
+                        "⚠️ Warcraft Logs не нашёл публичный отчёт "
+                        f"за РТ {queued['raid_date']} в течение "
+                        f"{config.WARCRAFTLOGS_REPORT_MAX_AGE_HOURS} ч.",
+                        cooldown_minutes=24 * 60,
+                    )
+                continue
+
+            raid_date = datetime.strptime(
+                str(queued["raid_date"]), "%Y-%m-%d"
+            ).strftime("%d.%m.%Y")
+            await send_channel_chunks(
+                channel, warcraftlogs_report_lines(report, raid_date)
+            )
+            store.complete_warcraftlogs_report(
+                session_id, report.code, utc_timestamp()
+            )
+            store.set_state(
+                "last_warcraftlogs_success", datetime.now(MSK).isoformat()
+            )
+            store.set_state("warcraftlogs_failure_count", "0")
+            store.set_state("last_warcraftlogs_error", "")
+            logger.info(
+                "Опубликован Warcraft Logs отчёт %s для РТ #%s",
+                report.code,
+                session_id,
+            )
+        except (
+            WarcraftLogsAPIError,
+            discord.Forbidden,
+            discord.HTTPException,
+        ) as error:
+            failures = parse_state_int("warcraftlogs_failure_count") + 1
+            store.set_state("warcraftlogs_failure_count", str(failures))
+            store.set_state("last_warcraftlogs_error", str(error))
+            store.set_state(
+                "last_warcraftlogs_error_at", datetime.now(MSK).isoformat()
+            )
+            store.fail_warcraftlogs_report(
+                session_id,
+                str(error),
+                utc_timestamp()
+                + config.WARCRAFTLOGS_REPORT_RETRY_MINUTES * 60,
+            )
+            logger.exception(
+                "Не удалось обработать Warcraft Logs для РТ #%s", session_id
+            )
+            if failures >= config.BLIZZARD_API_FAILURE_ALERT_THRESHOLD:
+                await send_health_alert(
+                    "warcraftlogs_api",
+                    "⚠️ Warcraft Logs API недоступен "
+                    f"{failures} раз подряд: `{str(error)[:500]}`",
+                )
+
+
 @bot.event
 async def on_voice_state_update(
     member: discord.Member,
@@ -1645,7 +2108,14 @@ async def on_voice_state_update(
     datetime.min.replace(hour=19, minute=0, tzinfo=MSK).timetz(),
 ])
 async def scheduled_role_sync() -> None:
-    await synchronize_guild_roles()
+    store.set_state(
+        "last_scheduled_role_sync_attempt", datetime.now(MSK).isoformat()
+    )
+    success, _, _ = await synchronize_guild_roles()
+    if success:
+        store.set_state(
+            "last_scheduled_role_sync_success", datetime.now(MSK).isoformat()
+        )
 
 
 @tasks.loop(time=datetime.min.replace(hour=5, minute=0, tzinfo=MSK).timetz())
@@ -1654,6 +2124,7 @@ async def reset_weekly_stats() -> None:
         return
     store.clear_stats()
     store.set_state("stats_period", current_stats_period())
+    store.set_state("last_weekly_reset_success", datetime.now(MSK).isoformat())
     logger.info("Недельная статистика сброшена")
 
 
@@ -1780,10 +2251,109 @@ async def scheduled_pidor_of_the_day() -> None:
         if selected is None:
             logger.warning("Нет кандидатов для автоматического pidor_of_the_day")
             return
+        store.set_state(
+            "last_pidor_schedule_date", datetime.now(MSK).date().isoformat()
+        )
         if not is_new:
             return
         message = await channel.send("Что тут у нас?")
         await animate_pidor_message(message, selected)
+
+
+def latest_due_role_sync(now: datetime) -> datetime:
+    candidates = [
+        now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        for hour in (8, 13, 19)
+    ]
+    candidates.append(
+        (now - timedelta(days=1)).replace(
+            hour=19, minute=0, second=0, microsecond=0
+        )
+    )
+    return max(candidate for candidate in candidates if candidate <= now)
+
+
+@tasks.loop(minutes=config.HEALTH_CHECK_INTERVAL_MINUTES)
+async def scheduled_health_check() -> None:
+    now = datetime.now(MSK)
+
+    due_sync = latest_due_role_sync(now)
+    last_sync_attempt = state_timestamp("last_scheduled_role_sync_attempt")
+    last_sync_success = state_timestamp("last_sync_success")
+    latest_sync_activity = max(
+        (
+            value
+            for value in (last_sync_attempt, last_sync_success)
+            if value is not None
+        ),
+        default=None,
+    )
+    if (
+        now - due_sync >= timedelta(minutes=30)
+        and (not latest_sync_activity or latest_sync_activity < due_sync)
+    ):
+        await send_health_alert(
+            f"missed_role_sync:{due_sync.isoformat()}",
+            "⏰ Не обнаружен запуск плановой синхронизации ролей "
+            f"за {due_sync.strftime('%d.%m.%Y %H:%M')} МСК.",
+            cooldown_minutes=24 * 60,
+        )
+
+    today = now.date().isoformat()
+    if now.weekday() in (4, 6) and now.time() >= datetime.min.replace(
+        hour=21, minute=0
+    ).time():
+        if store.get_state("last_reminder_date") != today:
+            await send_health_alert(
+                f"missed_raid_reminder:{today}",
+                "⏰ Автоматическое объявление РТ в 20:30 сегодня "
+                "не было опубликовано.",
+                cooldown_minutes=24 * 60,
+            )
+        if (
+            now.time()
+            >= datetime.min.replace(hour=21, minute=15).time()
+            and not store.raid_session_by_date(today)
+        ):
+            await send_health_alert(
+                f"missed_attendance_start:{today}",
+                "⏰ Учёт посещаемости сегодняшнего РТ не запустился.",
+                cooldown_minutes=24 * 60,
+            )
+
+    if now.time() >= datetime.min.replace(hour=21, minute=0).time():
+        if store.get_state("last_pidor_schedule_date") != today:
+            await send_health_alert(
+                f"missed_pidor:{today}",
+                "⏰ Автоматический запуск выбора дня в 20:30 "
+                "не подтверждён.",
+                cooldown_minutes=24 * 60,
+            )
+
+    if now.time() >= datetime.min.replace(hour=5, minute=0).time():
+        last_backup = state_timestamp("last_backup_success")
+        if not last_backup and backup_files():
+            last_backup = datetime.fromtimestamp(
+                backup_files()[0].stat().st_mtime, UTC
+            ).astimezone(MSK)
+        if not last_backup or last_backup.date() != now.date():
+            await send_health_alert(
+                f"missed_backup:{today}",
+                "⏰ Ежедневная резервная копия базы в 04:30 "
+                "не была создана.",
+                cooldown_minutes=24 * 60,
+            )
+
+    if (
+        now.weekday() == 2
+        and now.time() >= datetime.min.replace(hour=5, minute=30).time()
+        and store.get_state("stats_period") != current_stats_period()
+    ):
+        await send_health_alert(
+            f"missed_weekly_reset:{today}",
+            "⏰ Недельная статистика не была сброшена в среду в 05:00.",
+            cooldown_minutes=7 * 24 * 60,
+        )
 
 
 @bot.tree.command(name="pidor_of_the_day", description="Выбрать участника дня")
@@ -1852,19 +2422,27 @@ async def send_ephemeral_chunks(
         await interaction.followup.send(chunk, ephemeral=True)
 
 
-@bot.tree.command(name="absence", description="Предупредить об отсутствии на РТ")
+@bot.tree.command(name="absence", description="Предупредить об отсутствии или опоздании")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
 @app_commands.default_permissions()
 @has_command_role(
     GUILD_MEMBER_COMMAND_ROLE_IDS,
     "Команда доступна только участникам состава и Друзьям.",
 )
+@app_commands.choices(
+    notice_type=[
+        app_commands.Choice(name="Не приду", value="absence"),
+        app_commands.Choice(name="Опоздаю", value="late"),
+    ]
+)
 @app_commands.describe(
+    notice_type="Что произойдёт",
     raid_date="Дата РТ в формате ДД.ММ.ГГГГ",
-    reason="Причина отсутствия",
+    reason="Причина отсутствия или опоздания",
 )
 async def absence(
     interaction: discord.Interaction,
+    notice_type: app_commands.Choice[str],
     raid_date: str,
     reason: str,
 ) -> None:
@@ -1879,6 +2457,12 @@ async def absence(
             ephemeral=True,
         )
         return
+    cleaned_reason = reason.strip()
+    if not cleaned_reason:
+        await interaction.response.send_message(
+            "Укажите причину предупреждения.", ephemeral=True
+        )
+        return
     await interaction.response.defer(ephemeral=True)
     channel = bot.get_channel(config.RAID_ABSENCE_CHANNEL_ID)
     if channel is None or not hasattr(channel, "send"):
@@ -1886,16 +2470,23 @@ async def absence(
             "Канал предупреждений не найден.", ephemeral=True
         )
         return
+    notice_label = (
+        "опоздании" if notice_type.value == "late" else "отсутствии"
+    )
+    stored_reason = (
+        f"[{'Опоздание' if notice_type.value == 'late' else 'Отсутствие'}] "
+        f"{cleaned_reason}"
+    )
     published = await channel.send(
-        f"📅 {interaction.user.mention} предупредил об отсутствии или опоздании "
-        f"на РТ {parsed.strftime('%d.%m.%Y')}.\nПричина: {reason.strip()}"
+        f"📅 {interaction.user.mention} предупредил об **{notice_label}** "
+        f"на РТ {parsed.strftime('%d.%m.%Y')}.\nПричина: {cleaned_reason}"
     )
     try:
         await save_notice_message(
             published,
             interaction.user.id,
             parsed,
-            reason,
+            stored_reason,
         )
     except (discord.Forbidden, discord.HTTPException):
         logger.exception("Не удалось поставить реакцию под предупреждением")
@@ -2345,6 +2936,149 @@ async def sync_status(interaction: discord.Interaction) -> None:
     )
 
 
+async def audit_member_roles(
+    member: discord.Member,
+    roster: list[GuildCharacter],
+) -> list[str]:
+    managed_ids = set(config.GUILD_RANK_ROLE_IDS.values())
+    current_rank_roles = [
+        role for role in member.roles if role.id in managed_ids
+    ]
+    healer_role = member.guild.get_role(config.ROLE_IDS["HILA_NA_KRUTILAH"])
+    has_healer_role = bool(healer_role and healer_role in member.roles)
+    character = highest_guild_character(member, roster)
+    issues: list[str] = []
+
+    if character is None:
+        if current_rank_roles or has_healer_role:
+            roles = [
+                *current_rank_roles,
+                *([healer_role] if has_healer_role and healer_role else []),
+            ]
+            waiting_since = store.get_absence(member.id)
+            waiting = ""
+            if waiting_since:
+                elapsed = utc_timestamp() - waiting_since
+                remaining = max(
+                    0,
+                    config.GUILD_ROLE_REMOVAL_GRACE_HOURS
+                    - int(elapsed // 3600),
+                )
+                waiting = f"; ожидание снятия — около {remaining} ч."
+            issues.append(
+                f"{member.mention}: не найден в составе, но есть роли "
+                f"**{', '.join(role.name for role in roles)}**{waiting}"
+            )
+        return issues
+
+    expected_role_id = config.GUILD_RANK_ROLE_IDS.get(character.rank)
+    expected_role = (
+        member.guild.get_role(expected_role_id) if expected_role_id else None
+    )
+    if expected_role is None:
+        issues.append(
+            f"{member.mention}: персонаж **{character.name}**, ранг "
+            f"{character.rank}, но роль для ранга не настроена или не найдена."
+        )
+        return issues
+
+    if expected_role not in member.roles:
+        issues.append(
+            f"{member.mention}: **{character.name}**, ранг {character.rank}; "
+            f"нет ожидаемой роли {expected_role.mention}."
+        )
+    obsolete = [
+        role.mention
+        for role in current_rank_roles
+        if role.id != expected_role.id
+    ]
+    if obsolete:
+        issues.append(
+            f"{member.mention}: лишние гильдейские роли "
+            f"{', '.join(obsolete)}; ожидается {expected_role.mention}."
+        )
+
+    if character.rank == 2 and healer_role:
+        details: list[str] = []
+        healer_status = await member_healer_status(member, roster, details)
+        if healer_status is True and not has_healer_role:
+            issues.append(
+                f"{member.mention}: Сержант-лекарь без роли "
+                f"{healer_role.mention}."
+            )
+        elif healer_status is False and has_healer_role:
+            issues.append(
+                f"{member.mention}: роль {healer_role.mention} есть, "
+                "но активная специализация не лекарь."
+            )
+        elif healer_status is None:
+            issues.append(
+                f"{member.mention}: не удалось проверить специализацию "
+                f"({'; '.join(details[-2:]) or 'нет данных'})."
+            )
+    elif has_healer_role and healer_role:
+        issues.append(
+            f"{member.mention}: роль {healer_role.mention} доступна только "
+            "Сержантам-лекарям."
+        )
+    return issues
+
+
+@bot.tree.command(
+    name="role_audit",
+    description="Проверить расхождения ролей с Blizzard без изменений",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    OFFICER_COMMAND_ROLE_IDS,
+    "Команда доступна только офицерам.",
+)
+@app_commands.describe(
+    member="Необязательно: проверить только одного участника"
+)
+async def role_audit(
+    interaction: discord.Interaction,
+    member: Optional[discord.Member] = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    try:
+        roster = await fetch_guild_roster()
+    except BlizzardAPIError:
+        await interaction.followup.send(
+            "Проверка не выполнена: Blizzard API недоступен.",
+            ephemeral=True,
+        )
+        return
+
+    members = [member] if member else [
+        guild_member
+        for guild_member in interaction.guild.members
+        if not guild_member.bot
+    ]
+    issues: list[str] = []
+    for guild_member in members:
+        issues.extend(await audit_member_roles(guild_member, roster))
+
+    if not issues:
+        await interaction.followup.send(
+            f"✅ Расхождений не найдено. Проверено участников: {len(members)}.",
+            ephemeral=True,
+        )
+        return
+    await send_ephemeral_chunks(
+        interaction,
+        [
+            f"🔍 **Аудит ролей** — проверено: {len(members)}, "
+            f"расхождений: {len(issues)}.",
+            *issues,
+            "",
+            "Роли не изменялись. Для исправления используйте `/sync_member` "
+            "или `/sync`.",
+        ],
+    )
+
+
 @bot.tree.command(name="sync", description="Вручную обновить роли из Blizzard")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
 @app_commands.default_permissions()
@@ -2552,6 +3286,59 @@ async def removal_queue(interaction: discord.Interaction) -> None:
     await send_ephemeral_chunks(interaction, lines)
 
 
+@bot.tree.command(name="event", description="Создать быстрый сбор с кнопками")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
+@app_commands.choices(
+    event_type=[
+        app_commands.Choice(name="Ключи", value="key"),
+        app_commands.Choice(name="Героик", value="heroic"),
+        app_commands.Choice(name="Достижения", value="achievement"),
+        app_commands.Choice(name="Старый контент", value="legacy"),
+        app_commands.Choice(name="Другое", value="other"),
+    ]
+)
+@app_commands.describe(
+    event_type="Тип сбора",
+    title="Краткое название",
+    when="Дата и время понятным текстом, например Сегодня в 20:00",
+    max_participants="Размер основного состава; 0 — без ограничения",
+    description="Дополнительные условия или описание",
+)
+async def create_event(
+    interaction: discord.Interaction,
+    event_type: app_commands.Choice[str],
+    title: app_commands.Range[str, 2, 80],
+    when: app_commands.Range[str, 2, 80],
+    max_participants: app_commands.Range[int, 0, 40] = 0,
+    description: Optional[app_commands.Range[str, 1, 400]] = None,
+) -> None:
+    event_id = store.create_event(
+        interaction.channel_id,
+        interaction.user.id,
+        event_type.value,
+        str(title).strip(),
+        str(when).strip(),
+        str(description or "").strip(),
+        int(max_participants),
+        utc_timestamp(),
+    )
+    view = GuildEventView(event_id)
+    await interaction.response.send_message(
+        event_content(event_id),
+        view=view,
+        allowed_mentions=discord.AllowedMentions(
+            users=True, roles=False, everyone=False
+        ),
+    )
+    message = await interaction.original_response()
+    store.set_event_message(event_id, message.id)
+
+
 def frzok_mention(guild: discord.Guild) -> Optional[str]:
     if config.FRZOK_USER_ID:
         return f"<@{config.FRZOK_USER_ID}>"
@@ -2719,6 +3506,96 @@ async def loot_member(
     await send_ephemeral_chunks(interaction, lines)
 
 
+@bot.tree.command(
+    name="logs_report",
+    description="Опубликовать статистику Warcraft Logs за выбранную дату",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    OFFICER_COMMAND_ROLE_IDS,
+    "Команда доступна только офицерам.",
+)
+@app_commands.describe(
+    raid_date="Дата РТ в формате ДД.ММ.ГГГГ",
+)
+async def logs_report(
+    interaction: discord.Interaction,
+    raid_date: str,
+) -> None:
+    if not warcraftlogs.configured:
+        await interaction.response.send_message(
+            "Warcraft Logs API не настроен.", ephemeral=True
+        )
+        return
+    try:
+        parsed = parse_raid_date(raid_date)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    # Окно захватывает вечер выбранной даты и окончание РТ после полуночи.
+    search_start = parsed.replace(
+        hour=19, minute=0, second=0, microsecond=0
+    )
+    search_end = (parsed + timedelta(days=1)).replace(
+        hour=4, minute=0, second=0, microsecond=0
+    )
+    try:
+        report = await warcraftlogs.latest_report(
+            search_start.timestamp(),
+            search_end.timestamp(),
+        )
+    except WarcraftLogsAPIError as error:
+        store.set_state("last_warcraftlogs_error", str(error))
+        store.set_state(
+            "last_warcraftlogs_error_at", datetime.now(MSK).isoformat()
+        )
+        await interaction.followup.send(
+            f"Не удалось получить Warcraft Logs: {error}",
+            ephemeral=True,
+        )
+        return
+    if report is None:
+        await interaction.followup.send(
+            f"Публичный лог за {parsed.strftime('%d.%m.%Y')} не найден. "
+            "Проверьте дату и убедитесь, что лог опубликован от имени гильдии.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None or not hasattr(channel, "send"):
+        await interaction.followup.send(
+            "В этом канале нельзя опубликовать Warcraft Logs.",
+            ephemeral=True,
+        )
+        return
+    try:
+        await send_channel_chunks(
+            channel,
+            warcraftlogs_report_lines(
+                report, parsed.strftime("%d.%m.%Y")
+            ),
+        )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await interaction.followup.send(
+            f"Discord не позволил опубликовать отчёт: {error}",
+            ephemeral=True,
+        )
+        return
+    store.set_state(
+        "last_warcraftlogs_success", datetime.now(MSK).isoformat()
+    )
+    store.set_state("last_warcraftlogs_error", "")
+    await interaction.followup.send(
+        f"Статистика за {parsed.strftime('%d.%m.%Y')} опубликована "
+        f"в {channel.mention}.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="bot_status", description="Административное состояние бота")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
 @app_commands.default_permissions()
@@ -2738,10 +3615,12 @@ async def bot_status(interaction: discord.Interaction) -> None:
             check_empty_channels,
             check_tactics_reminders,
             check_raid_loot_reports,
+            check_warcraftlogs_reports,
             scheduled_raid_reminder,
             reset_weekly_stats,
             scheduled_role_sync,
             scheduled_pidor_of_the_day,
+            scheduled_health_check,
             attendance_heartbeat,
             scheduled_attendance_start,
             scheduled_attendance_end,
@@ -2757,6 +3636,12 @@ async def bot_status(interaction: discord.Interaction) -> None:
                 f"WoW Audit API: {'✅ настроен' if wowaudit.configured else '❌ не настроен'}",
                 "Последний ответ WoW Audit: "
                 + format_msk_timestamp(store.get_state("last_wowaudit_success")),
+                f"Warcraft Logs API: "
+                f"{'✅ настроен' if warcraftlogs.configured else '❌ не настроен'}",
+                "Последний отчёт Warcraft Logs: "
+                + format_msk_timestamp(
+                    store.get_state("last_warcraftlogs_success")
+                ),
                 f"Ошибок API подряд: {parse_state_int('api_failure_count')}",
                 f"Последний состав: {counts['roster']} персонажей",
                 f"Кэш специализаций: {counts['spec_cache']} персонажей",
@@ -2771,7 +3656,9 @@ async def bot_status(interaction: discord.Interaction) -> None:
                 f"Ожидающие напоминания о тактиках: "
                 f"{counts['tactics_reminders']}",
                 f"Учтённые записи WoW Audit: {counts['wowaudit_loot_seen']}",
-                f"Запущенные фоновые задачи: {loops_running}/12",
+                f"События/записи: "
+                f"{counts['events']}/{counts['event_participants']}",
+                f"Запущенные фоновые задачи: {loops_running}/14",
                 f"Следующая синхронизация: {next_sync}",
                 "Автовыбор участника дня: ежедневно в 20:30 МСК",
                 "Объявление РТ: Пт/Вс в 20:30 МСК",

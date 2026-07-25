@@ -67,6 +67,7 @@ def purge_database(
             "raid_notice_messages": "member_id",
             "temp_channels": "owner_id",
             "tactics_reminders": "author_id",
+            "guild_event_participants": "member_id",
         }
         for table, column in member_tables.items():
             deleted += delete_where(
@@ -79,6 +80,25 @@ def purge_database(
                 "role_history",
                 "member_id=? OR actor_id=?",
                 (member_id, member_id),
+            )
+
+        if table_exists(connection, "guild_events"):
+            event_rows = connection.execute(
+                "SELECT id FROM guild_events WHERE creator_id=?",
+                (member_id,),
+            ).fetchall()
+            for event_row in event_rows:
+                deleted += delete_where(
+                    connection,
+                    "guild_event_participants",
+                    "event_id=?",
+                    (event_row[0],),
+                )
+            deleted += delete_where(
+                connection,
+                "guild_events",
+                "creator_id=?",
+                (member_id,),
             )
 
         if table_exists(connection, "bot_state"):

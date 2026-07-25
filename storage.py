@@ -131,6 +131,37 @@ class StateStore:
                     sent_at REAL,
                     FOREIGN KEY (session_id) REFERENCES raid_sessions(id)
                 );
+                CREATE TABLE IF NOT EXISTS warcraftlogs_reports (
+                    session_id INTEGER PRIMARY KEY,
+                    due_at REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    report_code TEXT,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    sent_at REAL,
+                    FOREIGN KEY (session_id) REFERENCES raid_sessions(id)
+                );
+                CREATE TABLE IF NOT EXISTS guild_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER,
+                    channel_id INTEGER NOT NULL,
+                    creator_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    scheduled_for TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    max_participants INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                );
+                CREATE TABLE IF NOT EXISTS guild_event_participants (
+                    event_id INTEGER NOT NULL,
+                    member_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (event_id, member_id),
+                    FOREIGN KEY (event_id) REFERENCES guild_events(id)
+                );
                 """
             )
             # Старые версии разрешали привязать одного персонажа нескольким
@@ -699,6 +730,184 @@ class StateStore:
                 (sent_at, session_id),
             )
 
+    def enqueue_warcraftlogs_report(
+        self, session_id: int, due_at: float
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO warcraftlogs_reports(session_id, due_at)
+                VALUES (?, ?)
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (session_id, due_at),
+            )
+
+    def due_warcraftlogs_reports(self, now: float) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT
+                    wlr.session_id,
+                    wlr.due_at,
+                    wlr.attempts,
+                    rs.raid_date,
+                    rs.started_at,
+                    rs.ended_at
+                FROM warcraftlogs_reports wlr
+                JOIN raid_sessions rs ON rs.id=wlr.session_id
+                WHERE wlr.status='pending' AND wlr.due_at<=?
+                ORDER BY wlr.due_at, wlr.session_id
+                """,
+                (now,),
+            ).fetchall()
+
+    def fail_warcraftlogs_report(
+        self,
+        session_id: int,
+        error: str,
+        retry_at: float,
+        abandon: bool = False,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE warcraftlogs_reports
+                SET attempts=attempts + 1, last_error=?, due_at=?,
+                    status=CASE WHEN ? THEN 'failed' ELSE 'pending' END
+                WHERE session_id=? AND status='pending'
+                """,
+                (error[:1000], retry_at, int(abandon), session_id),
+            )
+
+    def complete_warcraftlogs_report(
+        self, session_id: int, report_code: str, sent_at: float
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE warcraftlogs_reports
+                SET status='sent', report_code=?, sent_at=?, last_error=''
+                WHERE session_id=?
+                """,
+                (report_code, sent_at, session_id),
+            )
+
+    def create_event(
+        self,
+        channel_id: int,
+        creator_id: int,
+        event_type: str,
+        title: str,
+        scheduled_for: str,
+        description: str,
+        max_participants: int,
+        created_at: float,
+    ) -> int:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO guild_events(
+                    channel_id, creator_id, event_type, title,
+                    scheduled_for, description, max_participants, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    channel_id,
+                    creator_id,
+                    event_type,
+                    title,
+                    scheduled_for,
+                    description,
+                    max_participants,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def set_event_message(self, event_id: int, message_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE guild_events SET message_id=? WHERE id=?",
+                (message_id, event_id),
+            )
+
+    def event(self, event_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT id, message_id, channel_id, creator_id, event_type,
+                       title, scheduled_for, description, max_participants,
+                       created_at, status
+                FROM guild_events WHERE id=?
+                """,
+                (event_id,),
+            ).fetchone()
+
+    def open_events(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT id, message_id, channel_id, creator_id, event_type,
+                       title, scheduled_for, description, max_participants,
+                       created_at, status
+                FROM guild_events
+                WHERE status='open' AND message_id IS NOT NULL
+                ORDER BY id
+                """
+            ).fetchall()
+
+    def set_event_participant(
+        self,
+        event_id: int,
+        member_id: int,
+        status: str,
+        updated_at: float,
+    ) -> None:
+        with self._lock, self._connection:
+            if status == "removed":
+                self._connection.execute(
+                    """
+                    DELETE FROM guild_event_participants
+                    WHERE event_id=? AND member_id=?
+                    """,
+                    (event_id, member_id),
+                )
+                return
+            self._connection.execute(
+                """
+                INSERT INTO guild_event_participants(
+                    event_id, member_id, status, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(event_id, member_id) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+                """,
+                (event_id, member_id, status, updated_at),
+            )
+
+    def event_participants(self, event_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT member_id, status, updated_at
+                FROM guild_event_participants
+                WHERE event_id=?
+                ORDER BY
+                    CASE status WHEN 'going' THEN 0 ELSE 1 END,
+                    updated_at,
+                    member_id
+                """,
+                (event_id,),
+            ).fetchall()
+
+    def close_event(self, event_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE guild_events SET status='closed' WHERE id=?",
+                (event_id,),
+            )
+
     def set_absence(
         self, raid_date: str, member_id: int, reason: str, created_at: float
     ) -> None:
@@ -1056,6 +1265,9 @@ class StateStore:
             "tactics_reminders": "tactics_reminders",
             "wowaudit_loot_seen": "wowaudit_loot_seen",
             "raid_loot_reports": "raid_loot_reports",
+            "warcraftlogs_reports": "warcraftlogs_reports",
+            "events": "guild_events",
+            "event_participants": "guild_event_participants",
         }
         result: dict[str, int] = {}
         with self._lock:
