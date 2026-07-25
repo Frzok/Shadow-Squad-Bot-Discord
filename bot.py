@@ -1224,7 +1224,7 @@ async def on_ready() -> None:
         check_empty_channels,
         check_tactics_reminders,
         check_raid_loot_reports,
-        send_weekly_messages,
+        scheduled_raid_reminder,
         reset_weekly_stats,
         scheduled_role_sync,
         scheduled_pidor_of_the_day,
@@ -1657,29 +1657,55 @@ async def reset_weekly_stats() -> None:
     logger.info("Недельная статистика сброшена")
 
 
+def raid_start_announcement_content(
+    role_id: int,
+    user_mention: str,
+) -> str:
+    return (
+        f"**<@&{role_id}>** "
+        "РТ старт сбор! Для инвайта в рейд необходимо поставить + "
+        f"в ПМ в игре **{user_mention}**"
+    )
+
+
+def raid_reminder_is_due(now: datetime) -> bool:
+    if now.weekday() not in (4, 6):
+        return False
+    start = now.replace(hour=20, minute=30, second=0, microsecond=0)
+    cutoff = now.replace(hour=21, minute=0, second=0, microsecond=0)
+    return start <= now < cutoff
+
+
 @tasks.loop(minutes=1)
-async def send_weekly_messages() -> None:
-    if not all(
-        (
-            config.REMINDER_CHANNEL_ID,
-            config.REMINDER_ROLE_ID,
-            config.REMINDER_USER_ID,
-        )
-    ):
-        return
+async def scheduled_raid_reminder() -> None:
     now = datetime.now(MSK)
-    if now.weekday() not in (4, 6) or (now.hour, now.minute) != (20, 30):
+    if not raid_reminder_is_due(now):
         return
     reminder_key = now.date().isoformat()
     if store.get_state("last_reminder_date") == reminder_key:
         return
     channel = bot.get_channel(config.REMINDER_CHANNEL_ID)
-    if channel:
-        await channel.send(
-            f"<@&{config.REMINDER_ROLE_ID}> РТ Старт Сбор + в ПМ "
-            f"<@{config.REMINDER_USER_ID}>"
+    if channel is None or not hasattr(channel, "send"):
+        logger.error(
+            "Канал автоматического объявления РТ %s не найден",
+            config.REMINDER_CHANNEL_ID,
         )
-        store.set_state("last_reminder_date", reminder_key)
+        return
+    try:
+        await channel.send(
+            raid_start_announcement_content(
+                config.REMINDER_ROLE_ID,
+                f"<@{config.REMINDER_USER_ID}>",
+            )
+        )
+    except discord.DiscordException:
+        logger.exception("Не удалось опубликовать автоматическое объявление РТ")
+        return
+    store.set_state("last_reminder_date", reminder_key)
+    logger.info(
+        "Автоматическое объявление РТ опубликовано в канале %s",
+        config.REMINDER_CHANNEL_ID,
+    )
 
 
 def select_pidor_for_today(
@@ -2434,10 +2460,9 @@ async def rt_start(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
-    content = (
-        f"**<@&{config.ROLE_IDS['SERGEANT']}>** "
-        "РТ старт сбор! Для инвайта в рейд необходимо поставить + "
-        f"в ПМ в игре **{mention}**"
+    content = raid_start_announcement_content(
+        config.ROLE_IDS["SERGEANT"],
+        mention,
     )
     await publish_raid_announcement(interaction, content)
 
@@ -2553,7 +2578,7 @@ async def bot_status(interaction: discord.Interaction) -> None:
             check_empty_channels,
             check_tactics_reminders,
             check_raid_loot_reports,
-            send_weekly_messages,
+            scheduled_raid_reminder,
             reset_weekly_stats,
             scheduled_role_sync,
             scheduled_pidor_of_the_day,
@@ -2589,6 +2614,9 @@ async def bot_status(interaction: discord.Interaction) -> None:
                 f"Запущенные фоновые задачи: {loops_running}/12",
                 f"Следующая синхронизация: {next_sync}",
                 "Автовыбор участника дня: ежедневно в 20:30 МСК",
+                "Объявление РТ: Пт/Вс в 20:30 МСК",
+                "Последнее объявление РТ: "
+                + (store.get_state("last_reminder_date") or "нет"),
                 "Учёт РТ: Пт/Вс, 21:00–00:00 МСК",
                 f"Сброс статистики: {next_reset}",
                 f"Время работы процесса: {hours} ч. {minutes} мин.",
