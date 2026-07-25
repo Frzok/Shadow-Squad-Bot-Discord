@@ -931,6 +931,35 @@ class StateStore:
             ).fetchall()
         return {int(row["member_id"]): row["reason"] for row in rows}
 
+    def cancel_member_absence(
+        self, raid_date: str, member_id: int
+    ) -> list[sqlite3.Row]:
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT message_id, channel_id, raid_date, member_id,
+                       emoji, reason, created_at
+                FROM raid_notice_messages
+                WHERE raid_date=? AND member_id=?
+                """,
+                (raid_date, member_id),
+            ).fetchall()
+            self._connection.execute(
+                """
+                DELETE FROM raid_notice_messages
+                WHERE raid_date=? AND member_id=?
+                """,
+                (raid_date, member_id),
+            )
+            self._connection.execute(
+                """
+                DELETE FROM raid_absences
+                WHERE raid_date=? AND member_id=?
+                """,
+                (raid_date, member_id),
+            )
+        return rows
+
     def save_raid_notice(
         self,
         message_id: int,

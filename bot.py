@@ -1505,6 +1505,7 @@ async def on_ready() -> None:
         check_raid_loot_reports,
         check_warcraftlogs_reports,
         scheduled_raid_reminder,
+        scheduled_absence_reminder,
         reset_weekly_stats,
         scheduled_role_sync,
         scheduled_pidor_of_the_day,
@@ -1850,7 +1851,72 @@ async def check_raid_loot_reports() -> None:
             )
 
 
-def warcraftlogs_report_lines(report: WarcraftLogsReport, raid_date: str) -> list[str]:
+def warcraftlogs_raid_window(raid_date: datetime) -> tuple[datetime, datetime]:
+    return (
+        raid_date.replace(hour=19, minute=0, second=0, microsecond=0),
+        (raid_date + timedelta(days=1)).replace(
+            hour=4, minute=0, second=0, microsecond=0
+        ),
+    )
+
+
+async def warcraftlogs_report_for_date(
+    raid_date: datetime,
+) -> Optional[WarcraftLogsReport]:
+    search_start, search_end = warcraftlogs_raid_window(raid_date)
+    return await warcraftlogs.latest_report(
+        search_start.timestamp(), search_end.timestamp()
+    )
+
+
+async def previous_warcraftlogs_report(
+    report: WarcraftLogsReport,
+) -> Optional[WarcraftLogsReport]:
+    current_day = datetime.fromtimestamp(report.start_time, MSK).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    checked_raid_days = 0
+    for days_ago in range(1, 22):
+        candidate_day = current_day - timedelta(days=days_ago)
+        if candidate_day.weekday() not in (4, 6):
+            continue
+        checked_raid_days += 1
+        previous = await warcraftlogs_report_for_date(candidate_day)
+        if (
+            previous
+            and previous.code != report.code
+            and previous.zone_name == report.zone_name
+        ):
+            return previous
+        if checked_raid_days >= 6:
+            break
+    return None
+
+
+def warcraftlogs_progress(
+    report: WarcraftLogsReport,
+) -> tuple[int, int, Optional[float]]:
+    fights = [
+        fight
+        for fight in report.fights
+        if int(fight.get("encounterID") or 0) > 0
+    ]
+    kills = sum(bool(fight.get("kill")) for fight in fights)
+    wipes = len(fights) - kills
+    percentages = [
+        float(fight["fightPercentage"])
+        for fight in fights
+        if not fight.get("kill")
+        and fight.get("fightPercentage") is not None
+    ]
+    return kills, wipes, min(percentages) if percentages else None
+
+
+def warcraftlogs_report_lines(
+    report: WarcraftLogsReport,
+    raid_date: str,
+    previous: Optional[WarcraftLogsReport] = None,
+) -> list[str]:
     boss_fights = [
         fight
         for fight in report.fights
@@ -1909,18 +1975,88 @@ def warcraftlogs_report_lines(report: WarcraftLogsReport, raid_date: str) -> lis
             f"**{fastest.get('name', 'босс')}**, "
             f"{duration // 60}:{duration % 60:02d}."
         )
+    if previous:
+        current_kills, current_wipes, current_best = warcraftlogs_progress(report)
+        old_kills, old_wipes, old_best = warcraftlogs_progress(previous)
+        best_text = ""
+        if current_best is not None or old_best is not None:
+            best_text = (
+                "; лучший незакрытый пул: "
+                f"{old_best:.1f}% → {current_best:.1f}%"
+                if old_best is not None and current_best is not None
+                else f"; лучший незакрытый пул: "
+                f"{current_best if current_best is not None else old_best:.1f}%"
+            )
+        lines.append(
+            "📊 Сравнение с предыдущим РТ: "
+            f"убийства {old_kills} → {current_kills}, "
+            f"вайпы {old_wipes} → {current_wipes}{best_text}."
+        )
     lines.append(f"🔗 [Открыть полный отчёт]({report.url})")
     return lines
 
 
-async def send_channel_chunks(channel, lines: list[str]) -> None:
+def warcraftlogs_death_lines(
+    report: WarcraftLogsReport, raid_date: str
+) -> list[str]:
+    deaths_by_fight: dict[int, list[str]] = {}
+    for death in report.death_events:
+        deaths_by_fight.setdefault(death.fight_id, []).append(
+            death.player_name
+        )
+    lines = [
+        f"💀 **Первые две смерти по пулам — {raid_date}**",
+        f"**{report.title}**",
+    ]
+    frequent_deaths = sorted(
+        report.deaths.items(),
+        key=lambda item: (-item[1], item[0].casefold()),
+    )
+    if frequent_deaths:
+        lines.append(
+            "**Чаще попадали в первые две смерти:** "
+            + ", ".join(
+                f"{name} — {amount}" for name, amount in frequent_deaths[:15]
+            )
+        )
+    else:
+        lines.append("Учтённых смертей в боссовых пулах нет.")
+    pull_numbers: dict[str, int] = {}
+    for fight in report.fights:
+        if int(fight.get("encounterID") or 0) <= 0:
+            continue
+        boss = str(fight.get("name") or "Неизвестный босс")
+        pull_numbers[boss] = pull_numbers.get(boss, 0) + 1
+        deaths = deaths_by_fight.get(int(fight["id"]), [])
+        result = "килл" if fight.get("kill") else "вайп"
+        percentage = fight.get("fightPercentage")
+        progress = (
+            f", остаток {float(percentage):.1f}%"
+            if percentage is not None and not fight.get("kill")
+            else ""
+        )
+        death_text = ", ".join(deaths) if deaths else "учтённых смертей нет"
+        lines.append(
+            f"• **{boss}, пул {pull_numbers[boss]}** — "
+            f"{death_text} · {result}{progress}"
+        )
+    lines.append(f"🔗 [Открыть полный отчёт]({report.url})")
+    return lines
+
+
+async def send_channel_chunks(
+    channel,
+    lines: list[str],
+    allowed_mentions: Optional[discord.AllowedMentions] = None,
+) -> None:
+    mentions = allowed_mentions or discord.AllowedMentions.none()
     current = ""
     for line in lines:
         candidate = f"{current}\n{line}" if current else line
         if len(candidate) > 1900 and current:
             await channel.send(
                 current,
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=mentions,
             )
             current = line
         else:
@@ -1928,7 +2064,7 @@ async def send_channel_chunks(channel, lines: list[str]) -> None:
     if current:
         await channel.send(
             current,
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=mentions,
         )
 
 
@@ -1982,8 +2118,16 @@ async def check_warcraftlogs_reports() -> None:
             raid_date = datetime.strptime(
                 str(queued["raid_date"]), "%Y-%m-%d"
             ).strftime("%d.%m.%Y")
+            try:
+                previous = await previous_warcraftlogs_report(report)
+            except WarcraftLogsAPIError:
+                previous = None
+                logger.warning(
+                    "Не удалось получить предыдущий Warcraft Logs для сравнения"
+                )
             await send_channel_chunks(
-                channel, warcraftlogs_report_lines(report, raid_date)
+                channel,
+                warcraftlogs_report_lines(report, raid_date, previous),
             )
             store.complete_warcraftlogs_report(
                 session_id, report.code, utc_timestamp()
@@ -2179,6 +2323,49 @@ async def scheduled_raid_reminder() -> None:
     )
 
 
+@tasks.loop(minutes=1)
+async def scheduled_absence_reminder() -> None:
+    now = datetime.now(MSK)
+    if now.weekday() not in (4, 6):
+        return
+    start = now.replace(hour=20, minute=30, second=0, microsecond=0)
+    cutoff = now.replace(hour=21, minute=0, second=0, microsecond=0)
+    if not start <= now < cutoff:
+        return
+    date_key = now.date().isoformat()
+    if store.get_state("last_absence_reminder_date") == date_key:
+        return
+    channel = bot.get_channel(config.SYNC_LOG_CHANNEL_ID)
+    guild = bot.get_guild(config.GUILD_ID)
+    if channel is None or not hasattr(channel, "send") or guild is None:
+        logger.error("Не найден канал напоминания об отсутствующих")
+        return
+    absences = store.absences_for_date(date_key)
+    lines = [
+        f"<@&{config.ROLE_IDS['RL']}> "
+        f"<@&{config.ROLE_IDS['BANNER_BEARER']}>",
+        f"📋 **Предупреждения перед РТ {now.strftime('%d.%m.%Y')}**",
+    ]
+    for member_id, reason in absences.items():
+        member = guild.get_member(member_id)
+        label = member.mention if member else f"Discord ID `{member_id}`"
+        lines.append(f"• {label} — {reason[:500]}")
+    if not absences:
+        lines.append("Предупреждений об отсутствии или опоздании нет.")
+    try:
+        await send_channel_chunks(
+            channel,
+            lines,
+            allowed_mentions=discord.AllowedMentions(
+                users=True, roles=True, everyone=False
+            ),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("Не удалось отправить список отсутствующих перед РТ")
+        return
+    store.set_state("last_absence_reminder_date", date_key)
+
+
 def select_pidor_for_today(
     guild: discord.Guild,
 ) -> tuple[Optional[discord.Member], bool]:
@@ -2310,6 +2497,13 @@ async def scheduled_health_check() -> None:
                 "не было опубликовано.",
                 cooldown_minutes=24 * 60,
             )
+        if store.get_state("last_absence_reminder_date") != today:
+            await send_health_alert(
+                f"missed_absence_reminder:{today}",
+                "⏰ Напоминание офицерам со списком отсутствующих "
+                "перед сегодняшним РТ не было опубликовано.",
+                cooldown_minutes=24 * 60,
+            )
         if (
             now.time()
             >= datetime.min.replace(hour=21, minute=15).time()
@@ -2439,12 +2633,14 @@ async def send_ephemeral_chunks(
     notice_type="Что произойдёт",
     raid_date="Дата РТ в формате ДД.ММ.ГГГГ",
     reason="Причина отсутствия или опоздания",
+    arrival_time="Если опоздаете: ориентировочное время прихода ЧЧ:ММ",
 )
 async def absence(
     interaction: discord.Interaction,
     notice_type: app_commands.Choice[str],
     raid_date: str,
     reason: str,
+    arrival_time: Optional[str] = None,
 ) -> None:
     try:
         parsed = parse_raid_date(raid_date)
@@ -2463,6 +2659,19 @@ async def absence(
             "Укажите причину предупреждения.", ephemeral=True
         )
         return
+    arrival = arrival_time.strip() if arrival_time else ""
+    if arrival and notice_type.value != "late":
+        await interaction.response.send_message(
+            "Время прихода можно указывать только для типа «Опоздаю».",
+            ephemeral=True,
+        )
+        return
+    if arrival and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", arrival):
+        await interaction.response.send_message(
+            "Время прихода должно быть в формате ЧЧ:ММ, например 21:30.",
+            ephemeral=True,
+        )
+        return
     await interaction.response.defer(ephemeral=True)
     channel = bot.get_channel(config.RAID_ABSENCE_CHANNEL_ID)
     if channel is None or not hasattr(channel, "send"):
@@ -2474,12 +2683,15 @@ async def absence(
         "опоздании" if notice_type.value == "late" else "отсутствии"
     )
     stored_reason = (
-        f"[{'Опоздание' if notice_type.value == 'late' else 'Отсутствие'}] "
+        f"[{'Опоздание' if notice_type.value == 'late' else 'Отсутствие'}"
+        f"{f' до {arrival}' if arrival else ''}] "
         f"{cleaned_reason}"
     )
     published = await channel.send(
         f"📅 {interaction.user.mention} предупредил об **{notice_label}** "
-        f"на РТ {parsed.strftime('%d.%m.%Y')}.\nПричина: {cleaned_reason}"
+        f"на РТ {parsed.strftime('%d.%m.%Y')}."
+        f"{f' Ориентировочное время прихода: **{arrival} МСК**.' if arrival else ''}"
+        f"\nПричина: {cleaned_reason}"
     )
     try:
         await save_notice_message(
@@ -2498,6 +2710,86 @@ async def absence(
         return
     await interaction.followup.send(
         f"Предупреждение на {parsed.strftime('%d.%m.%Y')} опубликовано и сохранено.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="absence_list",
+    description="Показать предупреждения на выбранное РТ",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    OFFICER_COMMAND_ROLE_IDS,
+    "Команда доступна только офицерам.",
+)
+@app_commands.describe(raid_date="Дата РТ в формате ДД.ММ.ГГГГ")
+async def absence_list(
+    interaction: discord.Interaction, raid_date: str
+) -> None:
+    try:
+        parsed = parse_raid_date(raid_date)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    absences = store.absences_for_date(parsed.date().isoformat())
+    lines = [f"📋 Предупреждения на {parsed.strftime('%d.%m.%Y')}"]
+    for member_id, reason in absences.items():
+        member = interaction.guild.get_member(member_id)
+        label = member.mention if member else f"Discord ID `{member_id}`"
+        lines.append(f"• {label} — {reason}")
+    if not absences:
+        lines.append("Предупреждений нет.")
+    await interaction.response.send_message(
+        "\n".join(lines), ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="absence_cancel",
+    description="Отменить своё предупреждение на РТ",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
+@app_commands.describe(raid_date="Дата РТ в формате ДД.ММ.ГГГГ")
+async def absence_cancel(
+    interaction: discord.Interaction, raid_date: str
+) -> None:
+    try:
+        parsed = parse_raid_date(raid_date)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    date_key = parsed.date().isoformat()
+    existing = store.absences_for_date(date_key).get(interaction.user.id)
+    if existing is None:
+        await interaction.response.send_message(
+            f"Предупреждение на {parsed.strftime('%d.%m.%Y')} не найдено.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    notices = store.cancel_member_absence(date_key, interaction.user.id)
+    for notice in notices:
+        channel = bot.get_channel(int(notice["channel_id"]))
+        if channel is None or not hasattr(channel, "fetch_message"):
+            continue
+        try:
+            message = await channel.fetch_message(int(notice["message_id"]))
+            await message.remove_reaction(str(notice["emoji"]), bot.user)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.info(
+                "Не удалось убрать реакцию отменённого предупреждения %s",
+                notice["message_id"],
+            )
+    recalculate_after_notice_removal(date_key, interaction.user.id)
+    await interaction.followup.send(
+        f"Предупреждение на {parsed.strftime('%d.%m.%Y')} отменено.",
         ephemeral=True,
     )
 
@@ -2744,6 +3036,55 @@ async def attendance_member(
         note = f" — {row['note']}" if row["note"] else ""
         lines.append(f"{row['raid_date']}: {label}{note}")
     await send_ephemeral_chunks(interaction, lines)
+
+
+@bot.tree.command(
+    name="monthly_report",
+    description="Опубликовать общий отчёт по посещаемости за месяц",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    OFFICER_COMMAND_ROLE_IDS,
+    "Команда доступна только офицерам.",
+)
+@app_commands.describe(month="Месяц в формате ГГГГ-ММ")
+async def monthly_report(
+    interaction: discord.Interaction, month: Optional[str] = None
+) -> None:
+    try:
+        month_key = validate_month(month)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    rows = store.monthly_attendance(month_key)
+    raid_dates = sorted({str(row["raid_date"]) for row in rows})
+    status_counts = {
+        status: sum(1 for row in rows if row["status"] == status)
+        for status in ATTENDANCE_STATUS_LABELS
+    }
+    lines = [
+        f"📊 **Месячный отчёт за {month_key}**",
+        f"Подтверждённых РТ: **{len(raid_dates)}**"
+        + (f" ({', '.join(raid_dates)})" if raid_dates else ""),
+        "Итоги по отметкам: "
+        + ", ".join(
+            f"{ATTENDANCE_STATUS_LABELS[status].lower()} — {amount}"
+            for status, amount in status_counts.items()
+        ),
+        "",
+        "**Посещаемость участников:**",
+    ]
+    lines.extend(
+        attendance_summary(rows, interaction.guild)
+        or ["Подтверждённых записей за этот месяц нет."]
+    )
+    await send_channel_chunks(interaction.channel, lines)
+    await interaction.followup.send(
+        f"Месячный отчёт за {month_key} опубликован в этом канале.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="link", description="Связать участника с персонажами WoW")
@@ -3507,6 +3848,145 @@ async def loot_member(
 
 
 @bot.tree.command(
+    name="logs_member",
+    description="Статистика участника Warcraft Logs за дату",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    OFFICER_COMMAND_ROLE_IDS,
+    "Команда доступна только офицерам.",
+)
+@app_commands.describe(
+    member="Участник Discord",
+    raid_date="Дата РТ в формате ДД.ММ.ГГГГ",
+)
+async def logs_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    raid_date: str,
+) -> None:
+    try:
+        parsed = parse_raid_date(raid_date)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        report = await warcraftlogs_report_for_date(parsed)
+    except WarcraftLogsAPIError as error:
+        await interaction.followup.send(
+            f"Не удалось получить Warcraft Logs: {error}", ephemeral=True
+        )
+        return
+    if report is None:
+        await interaction.followup.send(
+            "Публичный лог за эту дату не найден.", ephemeral=True
+        )
+        return
+
+    candidates = member_character_candidates(member)
+    actor_ids = {
+        actor_id
+        for actor_id, name in report.actors.items()
+        if normalize_character_name(name) in candidates
+    }
+    matched_names = {
+        name
+        for name in report.actors.values()
+        if normalize_character_name(name) in candidates
+    }
+    boss_fights = [
+        fight
+        for fight in report.fights
+        if int(fight.get("encounterID") or 0) > 0
+    ]
+    participated = sum(
+        bool(actor_ids & {int(value) for value in fight.get("friendlyPlayers") or []})
+        for fight in boss_fights
+    )
+    deaths = sum(
+        amount
+        for name, amount in report.deaths.items()
+        if normalize_character_name(name) in candidates
+    )
+    rankings = [
+        (name, percent)
+        for name, percent in WarcraftLogsClient.best_rankings(
+            report.rankings, limit=100
+        )
+        if normalize_character_name(name) in candidates
+    ]
+    lines = [
+        f"👤 **Warcraft Logs: {member.display_name} — "
+        f"{parsed.strftime('%d.%m.%Y')}**",
+        "Персонажи в логе: "
+        + (", ".join(sorted(matched_names)) if matched_names else "не найдены"),
+        f"Участие в боссовых пулах: **{participated}/{len(boss_fights)}**",
+        f"Учтённые смерти: **{deaths}** "
+        "(только первые две смерти каждого пула)",
+    ]
+    if rankings:
+        lines.append(
+            "Лучшие результаты: "
+            + ", ".join(
+                f"**{name}** — {percent:.1f}%" for name, percent in rankings[:5]
+            )
+        )
+    else:
+        lines.append("Лучшие результаты: данных рейтинга нет.")
+    lines.append(f"🔗 [Открыть полный отчёт]({report.url})")
+    await send_channel_chunks(interaction.channel, lines)
+    await interaction.followup.send(
+        f"Статистика {member.mention} опубликована в этом канале.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="logs_deaths",
+    description="Первые две смерти каждого пула по боссам",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    OFFICER_COMMAND_ROLE_IDS,
+    "Команда доступна только офицерам.",
+)
+@app_commands.describe(raid_date="Дата РТ в формате ДД.ММ.ГГГГ")
+async def logs_deaths(
+    interaction: discord.Interaction, raid_date: str
+) -> None:
+    try:
+        parsed = parse_raid_date(raid_date)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        report = await warcraftlogs_report_for_date(parsed)
+    except WarcraftLogsAPIError as error:
+        await interaction.followup.send(
+            f"Не удалось получить Warcraft Logs: {error}", ephemeral=True
+        )
+        return
+    if report is None:
+        await interaction.followup.send(
+            "Публичный лог за эту дату не найден.", ephemeral=True
+        )
+        return
+    await send_channel_chunks(
+        interaction.channel,
+        warcraftlogs_death_lines(
+            report, parsed.strftime("%d.%m.%Y")
+        ),
+    )
+    await interaction.followup.send(
+        "Смерти по пулам опубликованы в этом канале.", ephemeral=True
+    )
+
+
+@bot.tree.command(
     name="logs_report",
     description="Опубликовать статистику Warcraft Logs за выбранную дату",
 )
@@ -3535,18 +4015,8 @@ async def logs_report(
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
-    # Окно захватывает вечер выбранной даты и окончание РТ после полуночи.
-    search_start = parsed.replace(
-        hour=19, minute=0, second=0, microsecond=0
-    )
-    search_end = (parsed + timedelta(days=1)).replace(
-        hour=4, minute=0, second=0, microsecond=0
-    )
     try:
-        report = await warcraftlogs.latest_report(
-            search_start.timestamp(),
-            search_end.timestamp(),
-        )
+        report = await warcraftlogs_report_for_date(parsed)
     except WarcraftLogsAPIError as error:
         store.set_state("last_warcraftlogs_error", str(error))
         store.set_state(
@@ -3573,10 +4043,14 @@ async def logs_report(
         )
         return
     try:
+        try:
+            previous = await previous_warcraftlogs_report(report)
+        except WarcraftLogsAPIError:
+            previous = None
         await send_channel_chunks(
             channel,
             warcraftlogs_report_lines(
-                report, parsed.strftime("%d.%m.%Y")
+                report, parsed.strftime("%d.%m.%Y"), previous
             ),
         )
     except (discord.Forbidden, discord.HTTPException) as error:
@@ -3617,6 +4091,7 @@ async def bot_status(interaction: discord.Interaction) -> None:
             check_raid_loot_reports,
             check_warcraftlogs_reports,
             scheduled_raid_reminder,
+            scheduled_absence_reminder,
             reset_weekly_stats,
             scheduled_role_sync,
             scheduled_pidor_of_the_day,
@@ -3658,12 +4133,14 @@ async def bot_status(interaction: discord.Interaction) -> None:
                 f"Учтённые записи WoW Audit: {counts['wowaudit_loot_seen']}",
                 f"События/записи: "
                 f"{counts['events']}/{counts['event_participants']}",
-                f"Запущенные фоновые задачи: {loops_running}/14",
+                f"Запущенные фоновые задачи: {loops_running}/15",
                 f"Следующая синхронизация: {next_sync}",
                 "Автовыбор участника дня: ежедневно в 20:30 МСК",
                 "Объявление РТ: Пт/Вс в 20:30 МСК",
                 "Последнее объявление РТ: "
                 + (store.get_state("last_reminder_date") or "нет"),
+                "Последний список отсутствующих перед РТ: "
+                + (store.get_state("last_absence_reminder_date") or "нет"),
                 "Учёт РТ: Пт/Вс, 21:00–00:00 МСК",
                 f"Сброс статистики: {next_reset}",
                 f"Время работы процесса: {hours} ч. {minutes} мин.",
