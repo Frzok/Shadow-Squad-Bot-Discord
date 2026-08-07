@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from raid_vacation import parse_user_date, vacation_from_state
 from storage import StateStore
 from warcraftlogs import WarcraftLogsClient
 
@@ -64,6 +65,32 @@ class EventStorageTests(unittest.TestCase):
                 self.assertIsNone(store.raid_notice(100))
             finally:
                 store.close()
+
+    def test_state_can_be_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite3"
+            store = StateStore(str(database))
+            try:
+                store.set_state("raid_vacation_start", "2026-08-01")
+                store.delete_state("raid_vacation_start")
+                self.assertIsNone(store.get_state("raid_vacation_start"))
+            finally:
+                store.close()
+
+
+class RaidVacationTests(unittest.TestCase):
+    def test_period_is_inclusive(self) -> None:
+        period = vacation_from_state("2026-08-01", "2026-08-10")
+        self.assertIsNotNone(period)
+        assert period is not None
+        self.assertTrue(period.includes(parse_user_date("01.08.2026")))
+        self.assertTrue(period.includes(parse_user_date("10.08.2026")))
+        self.assertFalse(period.includes(parse_user_date("11.08.2026")))
+
+    def test_invalid_period_is_not_loaded(self) -> None:
+        self.assertIsNone(vacation_from_state("2026-08-10", "2026-08-01"))
+        with self.assertRaises(ValueError):
+            parse_user_date("31.02.2026")
 
 
 class WarcraftLogsParsingTests(unittest.TestCase):

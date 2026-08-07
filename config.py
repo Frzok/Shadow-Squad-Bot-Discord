@@ -45,12 +45,14 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
 GUILD_ID = 604571954422218752
 SYNC_LOG_CHANNEL_ID = 723427989521432628
+STREAM_ANNOUNCEMENT_CHANNEL_ID = 604573142404562964
 RAID_ANNOUNCEMENT_CHANNEL_ID = 809402292284686346
 RAID_VOICE_CHANNEL_ID = 713419816857370624
 RAID_ABSENCE_CHANNEL_ID = 1200807297111306280
 TACTICS_CHANNEL_ID = 1485886206817599569
 TACTICS_NOTIFICATION_CHANNEL_ID = 810474409755541524
-LOOT_HISTORY_CHANNEL_ID = 1505909442758184960
+LOOT_HISTORY_CHANNEL_ID = 1055007278593482822
+RAID_ANALYSIS_CHANNEL_ID = 1345828084640776343
 RAID_NOTICE_EMOJI = "✅"
 # noinspection SpellCheckingInspection
 ROSTER_URL = (
@@ -65,7 +67,6 @@ ROLE_IDS = {
     "SERGEANT": 604574109485105194,
     "CHRONICLER": 665163320776720414,
     "HILA_NA_KRUTILAH": 987332716460650520,
-    "RECRUIT": 1263818118539776052,
     "FRIENDS": 632173311018926091,
     "GUEST": 809395293002137620,
 }
@@ -75,7 +76,6 @@ GUILD_RANK_ROLE_IDS = {
     1: ROLE_IDS["BANNER_BEARER"],
     2: ROLE_IDS["SERGEANT"],
     3: ROLE_IDS["CHRONICLER"],
-    4: ROLE_IDS["RECRUIT"],
 }
 
 if ROLE_IDS["FRIENDS"] in GUILD_RANK_ROLE_IDS.values():
@@ -143,7 +143,7 @@ WARCRAFTLOGS_REGION = os.getenv(
     "WARCRAFTLOGS_REGION", BLIZZARD_REGION
 ).strip().upper()
 WARCRAFTLOGS_REPORT_CHANNEL_ID = _int_env(
-    "WARCRAFTLOGS_REPORT_CHANNEL_ID", SYNC_LOG_CHANNEL_ID
+    "WARCRAFTLOGS_REPORT_CHANNEL_ID", RAID_ANALYSIS_CHANNEL_ID
 )
 
 # Необязательная карта вида {"Discord ID": ["Персонаж", "Альт"]}.
@@ -199,7 +199,7 @@ MESSAGES = {
         "Вступление в основной состав автоматически подтверждает, что ты "
         "ознакомился и согласен со всеми правилами гильдии. Они опубликованы "
         "в канале "
-        "[📌правила-и-роли]"
+        "[👋начать-здесь]"
         "(https://discord.com/channels/604571954422218752/809368762812989440).\n\n"
         "Пожалуйста, перед рейдом проверь:\n\n"
         "• необходимые аддоны — найдёшь в "
@@ -211,16 +211,16 @@ MESSAGES = {
         "(https://discord.com/channels/604571954422218752/1485886206817599569).\n\n"
         "Обязательные РТ проходят по **пятницам и воскресеньям "
         "с 21:00 до 00:00 МСК** в голосовом канале "
-        "[🎉\"Спец\" отряд]"
+        "[⚔️РТ・Спец-отряд]"
         "(https://discord.com/channels/604571954422218752/713419816857370624).\n\n"
         "Если не сможешь прийти или опоздаешь, заранее напиши в "
-        "[🐷опоздуны]"
+        "[🐷отсутствия-и-опоздания]"
         "(https://discord.com/channels/604571954422218752/1200807297111306280). "
         "Когда бот поставит под сообщением ✅, предупреждение будет учтено.\n\n"
         "Если твой привязанный персонаж играет в активной специализации "
         "лекаря, бот дополнительно выдаст роль **Хила на крутилах**. "
         "Если ты получил эту роль, хиловское обсуждение проходит в канале "
-        "[🙀крутилочная]"
+        "[💚чат-хилов]"
         "(https://discord.com/channels/604571954422218752/1279440882679939133).\n\n"
         "Все обращения по поводу изменения ролей, привязок персонажей "
         "или других данных необходимо направлять <@197371266007564289>.\n\n"

@@ -18,6 +18,13 @@ from discord.ext import commands, tasks
 import config
 from blizzard import BlizzardAPIError, BlizzardClient, GuildCharacter
 from storage import StateStore
+from raid_vacation import RaidVacation, parse_user_date, vacation_from_state
+from stream_notifications import (
+    TwitchStream,
+    register_active_stream,
+    twitch_preview_url,
+    twitch_stream_from_activities,
+)
 from warcraftlogs import (
     WarcraftLogsAPIError,
     WarcraftLogsClient,
@@ -54,12 +61,15 @@ logger = logging.getLogger("shadow-squad-bot")
 
 MSK = timezone(timedelta(hours=3), "MSK")
 UTC = timezone.utc
+RAID_VACATION_START_STATE = "raid_vacation_start"
+RAID_VACATION_END_STATE = "raid_vacation_end"
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
 intents.members = True
+intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 store = StateStore(config.STATE_DB_PATH)
@@ -94,6 +104,8 @@ suppressed_role_events: dict[tuple[int, int, str], float] = {}
 PROCESS_STARTED_AT = datetime.now(MSK)
 health_alert_lock = asyncio.Lock()
 event_lock = asyncio.Lock()
+stream_announcement_lock = asyncio.Lock()
+active_twitch_streams: dict[int, str] = {}
 
 ATTENDANCE_STATUS_LABELS = {
     "present": "Присутствовал",
@@ -111,7 +123,6 @@ GUILD_MEMBER_COMMAND_ROLE_IDS = frozenset(
         config.ROLE_IDS["BANNER_BEARER"],
         config.ROLE_IDS["SERGEANT"],
         config.ROLE_IDS["CHRONICLER"],
-        config.ROLE_IDS["RECRUIT"],
         config.ROLE_IDS["FRIENDS"],
     }
 )
@@ -172,6 +183,54 @@ def can_use_member_features(member: discord.Member) -> bool:
             and bool(role_ids & GUILD_MEMBER_COMMAND_ROLE_IDS)
         )
     )
+
+
+def member_twitch_stream(member: discord.Member) -> Optional[TwitchStream]:
+    return twitch_stream_from_activities(member.activities)
+
+
+def seed_active_twitch_streams(guild: discord.Guild) -> None:
+    active_twitch_streams.clear()
+    for member in guild.members:
+        if member.bot or not can_use_member_features(member):
+            continue
+        stream = member_twitch_stream(member)
+        if stream is not None:
+            active_twitch_streams[member.id] = stream.signature
+    logger.info(
+        "Twitch Presence инициализирован: уже активных стримов=%s",
+        len(active_twitch_streams),
+    )
+
+
+def stream_announcement_embed(
+    member: discord.Member,
+    stream: TwitchStream,
+) -> discord.Embed:
+    title = stream.title[:256]
+    game = stream.game[:1024]
+    embed = discord.Embed(
+        title=title,
+        url=stream.url,
+        colour=discord.Colour(0x9146FF),
+        timestamp=datetime.now(UTC),
+    )
+    embed.set_author(
+        name=f"{member.display_name} сейчас стримит на Twitch!"[:256],
+        url=stream.url,
+        icon_url=member.display_avatar.url,
+    )
+    embed.add_field(name="Игра", value=game, inline=True)
+    embed.add_field(
+        name="Смотреть",
+        value=f"[Открыть канал Twitch]({stream.url})",
+        inline=True,
+    )
+    embed.set_image(
+        url=twitch_preview_url(stream.login, int(datetime.now(UTC).timestamp()))
+    )
+    embed.set_footer(text="Shadow Squad • Twitch")
+    return embed
 
 
 def interaction_response(
@@ -469,6 +528,32 @@ def parse_raid_date(value: str) -> datetime:
     raise ValueError("Используйте дату в формате ДД.ММ.ГГГГ")
 
 
+def raid_vacation_period() -> Optional[RaidVacation]:
+    return vacation_from_state(
+        store.get_state(RAID_VACATION_START_STATE),
+        store.get_state(RAID_VACATION_END_STATE),
+    )
+
+
+def raid_announcements_paused(on_date=None) -> bool:
+    period = raid_vacation_period()
+    target = on_date or datetime.now(MSK).date()
+    return bool(period and period.includes(target))
+
+
+def raid_vacation_status_text(on_date=None) -> str:
+    period = raid_vacation_period()
+    if period is None:
+        return "не настроены"
+    target = on_date or datetime.now(MSK).date()
+    dates = f"{period.start.strftime('%d.%m.%Y')}–{period.end.strftime('%d.%m.%Y')}"
+    if period.includes(target):
+        return f"активны ({dates})"
+    if target < period.start:
+        return f"запланированы ({dates})"
+    return f"завершены ({dates})"
+
+
 def next_main_raid_date(now: Optional[datetime] = None) -> datetime:
     current = now or datetime.now(MSK)
     if current.weekday() in (4, 6):
@@ -624,22 +709,29 @@ def raid_voice_member_ids(guild: discord.Guild) -> set[int]:
     channel = guild.get_channel(config.RAID_VOICE_CHANNEL_ID)
     if not isinstance(channel, discord.VoiceChannel):
         return set()
-    return {member.id for member in channel.members if not member.bot}
+    return {
+        member.id
+        for member in channel.members
+        if is_eligible_raid_member(member)
+    }
 
 
 def temporary_channel_name(member: discord.Member) -> str:
     return (member.nick or member.display_name or member.name)[:100]
 
 
+def is_eligible_raid_member(member: discord.Member) -> bool:
+    return (
+        not member.bot
+        and any(role.id == config.ROLE_IDS["SERGEANT"] for role in member.roles)
+    )
+
+
 def eligible_raid_members(guild: discord.Guild) -> set[discord.Member]:
-    role_ids = set(config.GUILD_RANK_ROLE_IDS.values())
-    return {
-        member
-        for role in guild.roles
-        if role.id in role_ids
-        for member in role.members
-        if not member.bot
-    }
+    sergeant_role = guild.get_role(config.ROLE_IDS["SERGEANT"])
+    if sergeant_role is None:
+        return set()
+    return {member for member in sergeant_role.members if not member.bot}
 
 
 async def start_raid_attendance(
@@ -1537,6 +1629,7 @@ async def on_ready() -> None:
     ):
         if not loop.is_running():
             loop.start()
+    seed_active_twitch_streams(guild)
     startup_complete = True
     await send_health_alert(
         f"restart:{PROCESS_STARTED_AT.isoformat()}",
@@ -2191,6 +2284,57 @@ async def check_warcraftlogs_reports() -> None:
 
 
 @bot.event
+async def on_presence_update(
+    before: discord.Member,
+    after: discord.Member,
+) -> None:
+    if (
+        not startup_complete
+        or after.guild.id != config.GUILD_ID
+        or after.bot
+    ):
+        return
+
+    stream = member_twitch_stream(after)
+    if stream is None or not can_use_member_features(after):
+        async with stream_announcement_lock:
+            active_twitch_streams.pop(after.id, None)
+        return
+
+    async with stream_announcement_lock:
+        if not register_active_stream(active_twitch_streams, after.id, stream):
+            return
+
+    channel = bot.get_channel(config.STREAM_ANNOUNCEMENT_CHANNEL_ID)
+    if channel is None or not hasattr(channel, "send"):
+        logger.error(
+            "Канал уведомлений о стримах %s не найден",
+            config.STREAM_ANNOUNCEMENT_CHANNEL_ID,
+        )
+        async with stream_announcement_lock:
+            if active_twitch_streams.get(after.id) == stream.signature:
+                active_twitch_streams.pop(after.id, None)
+        return
+
+    try:
+        await channel.send(
+            embed=stream_announcement_embed(after, stream),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception(
+            "Не удалось опубликовать Twitch-стрим %s участника %s",
+            stream.url,
+            after,
+        )
+        async with stream_announcement_lock:
+            if active_twitch_streams.get(after.id) == stream.signature:
+                active_twitch_streams.pop(after.id, None)
+        return
+    logger.info("Опубликован Twitch-стрим %s участника %s", stream.url, after)
+
+
+@bot.event
 async def on_voice_state_update(
     member: discord.Member,
     before: discord.VoiceState,
@@ -2205,7 +2349,7 @@ async def on_voice_state_update(
         is_in_raid = bool(
             after.channel and after.channel.id == config.RAID_VOICE_CHANNEL_ID
         )
-        if is_in_raid and not was_in_raid and not member.bot:
+        if is_in_raid and not was_in_raid and is_eligible_raid_member(member):
             store.attendance_enter(session_id, member.id, utc_timestamp())
         elif was_in_raid and not is_in_raid:
             store.attendance_leave(session_id, member.id, utc_timestamp())
@@ -2315,6 +2459,11 @@ def raid_reminder_is_due(now: datetime) -> bool:
 async def scheduled_raid_reminder() -> None:
     now = datetime.now(MSK)
     if not raid_reminder_is_due(now):
+        return
+    if raid_announcements_paused(now.date()):
+        logger.debug(
+            "Автоматическое объявление РТ пропущено: действуют каникулы РТ"
+        )
         return
     reminder_key = now.date().isoformat()
     if store.get_state("last_reminder_date") == reminder_key:
@@ -2510,7 +2659,10 @@ async def scheduled_health_check() -> None:
     if now.weekday() in (4, 6) and now.time() >= datetime.min.replace(
         hour=21, minute=0
     ).time():
-        if store.get_state("last_reminder_date") != today:
+        if (
+            not raid_announcements_paused(now.date())
+            and store.get_state("last_reminder_date") != today
+        ):
             await send_health_alert(
                 f"missed_raid_reminder:{today}",
                 "⏰ Автоматическое объявление РТ в 20:30 сегодня "
@@ -3733,6 +3885,79 @@ async def publish_raid_announcement(
     )
 
 
+@bot.tree.command(
+    name="rt_vacation_set",
+    description="Отключить автоматические анонсы РТ на указанный период",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+@app_commands.describe(
+    start_date="Первый день каникул в формате ДД.ММ.ГГГГ",
+    end_date="Последний день каникул в формате ДД.ММ.ГГГГ",
+)
+async def rt_vacation_set(
+    interaction: discord.Interaction,
+    start_date: str,
+    end_date: str,
+) -> None:
+    try:
+        start = parse_user_date(start_date)
+        end = parse_user_date(end_date)
+    except ValueError as error:
+        await interaction_response(interaction).send_message(
+            str(error), ephemeral=True
+        )
+        return
+    if end < start:
+        await interaction_response(interaction).send_message(
+            "Дата окончания каникул не может быть раньше даты начала.",
+            ephemeral=True,
+        )
+        return
+    store.set_state(RAID_VACATION_START_STATE, start.isoformat())
+    store.set_state(RAID_VACATION_END_STATE, end.isoformat())
+    await interaction_response(interaction).send_message(
+        "🏖️ Каникулы РТ установлены: "
+        f"**{start.strftime('%d.%m.%Y')}–{end.strftime('%d.%m.%Y')}** включительно. "
+        "Автоматические анонсы РТ в этот период отправляться не будут.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="rt_vacation_cancel",
+    description="Отменить каникулы и снова включить автоматические анонсы РТ",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+async def rt_vacation_cancel(interaction: discord.Interaction) -> None:
+    period = raid_vacation_period()
+    store.delete_state(RAID_VACATION_START_STATE)
+    store.delete_state(RAID_VACATION_END_STATE)
+    message = (
+        "Каникулы РТ отменены. Автоматические анонсы снова включены."
+        if period
+        else "Каникулы РТ не были настроены. Автоматические анонсы включены."
+    )
+    await interaction_response(interaction).send_message(message, ephemeral=True)
+
+
+@bot.tree.command(
+    name="rt_vacation_status",
+    description="Показать период каникул для автоматических анонсов РТ",
+)
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+async def rt_vacation_status(interaction: discord.Interaction) -> None:
+    await interaction_response(interaction).send_message(
+        f"🏖️ Каникулы РТ: **{raid_vacation_status_text()}**.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="heroic", description="Объявить сбор в героик")
 @app_commands.guilds(discord.Object(id=config.GUILD_ID))
 @app_commands.default_permissions()
@@ -3749,7 +3974,6 @@ async def heroic(interaction: discord.Interaction) -> None:
     content = (
         f"**<@&{config.ROLE_IDS['SERGEANT']}>** "
         f"**<@&{config.ROLE_IDS['CHRONICLER']}>** "
-        f"**<@&{config.ROLE_IDS['RECRUIT']}>** "
         "Героик Старт Сбор. Для инвайта в рейд необходимо поставить + "
         f"в ПМ в игре **{mention}**"
     )
@@ -4158,6 +4382,7 @@ async def bot_status(interaction: discord.Interaction) -> None:
                 f"Следующая синхронизация: {next_sync}",
                 "Автовыбор участника дня: ежедневно в 20:30 МСК",
                 "Объявление РТ: Пт/Вс в 20:30 МСК",
+                "Каникулы анонсов РТ: " + raid_vacation_status_text(),
                 "Последнее объявление РТ: "
                 + (store.get_state("last_reminder_date") or "нет"),
                 "Последний список отсутствующих перед РТ: "

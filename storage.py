@@ -285,6 +285,10 @@ class StateStore:
                 (key, value),
             )
 
+    def delete_state(self, key: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute("DELETE FROM bot_state WHERE key=?", (key,))
+
     def linked_characters(self, member_id: int) -> list[str]:
         with self._lock:
             rows = self._connection.execute(
