@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import logging
 import random
 import re
@@ -17,8 +18,16 @@ from discord.ext import commands, tasks
 
 import config
 from blizzard import BlizzardAPIError, BlizzardClient, GuildCharacter
+from guild_navigation import (
+    NAVIGATION_ENTRIES,
+    discord_link_targets,
+    extract_timeline_version,
+    find_navigation_entries,
+    is_timeline_archive,
+)
 from storage import StateStore
 from raid_vacation import RaidVacation, parse_user_date, vacation_from_state
+from runtime_settings import SETTING_SPECS, parse_setting_value
 from stream_notifications import (
     TwitchStream,
     register_active_stream,
@@ -63,6 +72,10 @@ MSK = timezone(timedelta(hours=3), "MSK")
 UTC = timezone.utc
 RAID_VACATION_START_STATE = "raid_vacation_start"
 RAID_VACATION_END_STATE = "raid_vacation_end"
+SUPPORTERS_MESSAGE_STATE = "supporters_message_id"
+TIMELINE_STATUS_MESSAGE_STATE = "timeline_status_message_id"
+TIMELINE_SOURCE_MESSAGE_STATE = "timeline_source_message_id"
+PUBLISHED_LINKS_STATE = "published_links_broken_fingerprint"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -105,7 +118,18 @@ PROCESS_STARTED_AT = datetime.now(MSK)
 health_alert_lock = asyncio.Lock()
 event_lock = asyncio.Lock()
 stream_announcement_lock = asyncio.Lock()
+supporters_message_lock = asyncio.Lock()
+timeline_update_lock = asyncio.Lock()
+published_link_check_lock = asyncio.Lock()
 active_twitch_streams: dict[int, str] = {}
+
+SERGEANT_CHECKLIST_ITEMS = (
+    ("Правила", "Прочитал правила в 👋начать-здесь"),
+    ("Аддоны", "Установил обязательные рейдовые аддоны"),
+    ("Timeline", "Скачал и настроил актуальный Timeline Reminder"),
+    ("Archon", "Настроил Archon App и проверил запись"),
+    ("Тактики", "Открыл форум тактик и изучил нужные материалы"),
+)
 
 ATTENDANCE_STATUS_LABELS = {
     "present": "Присутствовал",
@@ -290,6 +314,113 @@ def event_content(event_id: int) -> str:
     return "\n".join(lines)
 
 
+def sergeant_checklist_content(checklist_id: int) -> str:
+    checklist = store.sergeant_checklist(checklist_id)
+    if checklist is None:
+        return "⚠️ Чек-лист не найден."
+    completed_mask = int(checklist["completed_mask"])
+    lines = [
+        "# 🪖 ЧЕК-ЛИСТ НОВОГО СЕРЖАНТА",
+        "",
+        f"**Игрок:** <@{checklist['member_id']}>",
+        f"**Создан:** <t:{int(checklist['created_at'])}:f>",
+        "",
+    ]
+    for index, (_, description) in enumerate(SERGEANT_CHECKLIST_ITEMS):
+        checked = bool(completed_mask & (1 << index))
+        lines.append(f"{'✅' if checked else '⬜'} {description}")
+    completed = bin(completed_mask).count("1")
+    lines.extend(("", f"**Готовность:** {completed}/{len(SERGEANT_CHECKLIST_ITEMS)}"))
+    if completed == len(SERGEANT_CHECKLIST_ITEMS):
+        lines.append("✅ **Подготовка завершена. Новый сержант готов к РТ.**")
+    else:
+        lines.append(
+            "Пункты отмечают офицеры после проверки подготовки игрока. "
+            "Повторное нажатие снимает отметку."
+        )
+    return "\n".join(lines)
+
+
+class SergeantChecklistView(discord.ui.View):
+    def __init__(self, checklist_id: int) -> None:
+        super().__init__(timeout=None)
+        self.checklist_id = checklist_id
+        checklist = store.sergeant_checklist(checklist_id)
+        completed_mask = int(checklist["completed_mask"]) if checklist else 0
+        for index, (label, _) in enumerate(SERGEANT_CHECKLIST_ITEMS):
+            checked = bool(completed_mask & (1 << index))
+            button = discord.ui.Button(
+                label=label,
+                emoji="✅" if checked else "⬜",
+                style=(
+                    discord.ButtonStyle.success
+                    if checked
+                    else discord.ButtonStyle.secondary
+                ),
+                custom_id=f"sergeant_checklist:{checklist_id}:{index}",
+            )
+            button.callback = functools.partial(self._toggle, item_index=index)
+            self.add_item(button)
+
+    async def _toggle(
+        self,
+        interaction: discord.Interaction,
+        *,
+        item_index: int,
+    ) -> None:
+        checklist = store.sergeant_checklist(self.checklist_id)
+        if checklist is None or checklist["status"] != "active":
+            await interaction_response(interaction).send_message(
+                "Этот чек-лист уже закрыт.", ephemeral=True
+            )
+            return
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction_response(interaction).send_message(
+                "Чек-лист доступен только на сервере.", ephemeral=True
+            )
+            return
+        role_ids = {role.id for role in member.roles}
+        allowed = member.guild_permissions.administrator or bool(
+            role_ids & OFFICER_COMMAND_ROLE_IDS
+        )
+        if not allowed:
+            await interaction_response(interaction).send_message(
+                "Отмечать служебный чек-лист могут только офицеры.",
+                ephemeral=True,
+            )
+            return
+        completed_mask = int(checklist["completed_mask"]) ^ (1 << item_index)
+        store.set_sergeant_checklist_mask(
+            self.checklist_id, completed_mask, utc_timestamp()
+        )
+        await interaction_response(interaction).edit_message(
+            content=sergeant_checklist_content(self.checklist_id),
+            view=SergeantChecklistView(self.checklist_id),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+async def publish_sergeant_checklist(member: discord.Member) -> None:
+    channel = member.guild.get_channel(config.SYNC_LOG_CHANNEL_ID)
+    if channel is None or not hasattr(channel, "send"):
+        logger.error("Канал bot-console для чек-листа сержанта не найден")
+        return
+    checklist_id = store.create_sergeant_checklist(member.id, utc_timestamp())
+    try:
+        message = await channel.send(
+            sergeant_checklist_content(checklist_id),
+            view=SergeantChecklistView(checklist_id),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        store.set_sergeant_checklist_message(
+            checklist_id, message.id, utc_timestamp()
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        store.close_sergeant_checklist(checklist_id, utc_timestamp())
+        logger.exception("Не удалось создать чек-лист нового сержанта %s", member)
+
+
 class GuildEventView(discord.ui.View):
     def __init__(self, event_id: int, disabled: bool = False) -> None:
         super().__init__(timeout=None)
@@ -400,6 +531,185 @@ class GuildEventView(discord.ui.View):
                 "Основной состав заполнен — вы добавлены в резерв.",
                 ephemeral=True,
             )
+
+
+def tactics_ack_content(guild: discord.Guild, source_message_id: int) -> str:
+    eligible = sorted(
+        eligible_raid_members(guild), key=lambda member: member.display_name.casefold()
+    )
+    acknowledged = store.tactics_acknowledged_members(source_message_id)
+    unread = [member.display_name for member in eligible if member.id not in acknowledged]
+    lines = [
+        f"📚 **Подтверждение тактики:** {len(eligible) - len(unread)}/{len(eligible)}",
+        "Нажмите **«Ознакомился»**, когда изучите материал.",
+    ]
+    if unread:
+        visible = ", ".join(unread[:25])
+        hidden = len(unread) - 25
+        lines.append(
+            "Ещё не подтвердили: "
+            + visible
+            + (f" (+ ещё {hidden})" if hidden > 0 else "")
+        )
+    else:
+        lines.append("✅ Все участники подтвердили ознакомление.")
+    return "\n".join(lines)[:1900]
+
+
+class TacticsAckView(discord.ui.View):
+    def __init__(self, source_message_id: int) -> None:
+        super().__init__(timeout=None)
+        self.source_message_id = source_message_id
+        button = discord.ui.Button(
+            label="Ознакомился",
+            emoji="✅",
+            style=discord.ButtonStyle.success,
+            custom_id=f"tactics_ack:{source_message_id}",
+        )
+        button.callback = self._acknowledge
+        self.add_item(button)
+
+    async def _acknowledge(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not is_eligible_raid_member(member):
+            await interaction_response(interaction).send_message(
+                "Подтверждение доступно участникам основного состава.",
+                ephemeral=True,
+            )
+            return
+        store.acknowledge_tactics(
+            self.source_message_id, member.id, utc_timestamp()
+        )
+        content = tactics_ack_content(member.guild, self.source_message_id)
+        await interaction_response(interaction).edit_message(content=content, view=self)
+        eligible_ids = {item.id for item in eligible_raid_members(member.guild)}
+        if eligible_ids <= store.tactics_acknowledged_members(self.source_message_id):
+            store.remove_tactics_reminder(self.source_message_id)
+
+
+def feedback_content(session_id: int, closed: bool = False) -> str:
+    session = store.raid_session(session_id)
+    date_text = (
+        datetime.strptime(str(session["raid_date"]), "%Y-%m-%d").strftime("%d.%m.%Y")
+        if session
+        else "неизвестная дата"
+    )
+    summary = store.raid_feedback_summary(session_id)
+    responses = int(summary["responses"] or 0)
+    lines = [
+        f"🗳️ **Анонимная оценка РТ за {date_text}**",
+        "Оцените организацию, темп и атмосферу. Имена участников не публикуются.",
+    ]
+    if responses:
+        lines.append(
+            f"Ответов: **{responses}** · организация: **{float(summary['organization']):.1f}/5** "
+            f"· темп: **{float(summary['pace']):.1f}/5** "
+            f"· атмосфера: **{float(summary['atmosphere']):.1f}/5**"
+        )
+    else:
+        lines.append("Ответов пока нет.")
+    if closed:
+        lines.append("🔒 Опрос завершён.")
+    return "\n".join(lines)
+
+
+class RaidFeedbackModal(discord.ui.Modal):
+    def __init__(self, session_id: int) -> None:
+        super().__init__(title="Анонимная оценка РТ")
+        self.session_id = session_id
+        self.organization = discord.ui.TextInput(
+            label="Организация (1–5)", min_length=1, max_length=1
+        )
+        self.pace = discord.ui.TextInput(
+            label="Темп РТ (1–5)", min_length=1, max_length=1
+        )
+        self.atmosphere = discord.ui.TextInput(
+            label="Атмосфера (1–5)", min_length=1, max_length=1
+        )
+        self.comment = discord.ui.TextInput(
+            label="Комментарий (необязательно)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+        )
+        for item in (self.organization, self.pace, self.atmosphere, self.comment):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not is_eligible_raid_member(member):
+            await interaction_response(interaction).send_message(
+                "Опрос доступен участникам основного состава.", ephemeral=True
+            )
+            return
+        try:
+            values = [
+                int(str(self.organization)),
+                int(str(self.pace)),
+                int(str(self.atmosphere)),
+            ]
+        except ValueError:
+            values = []
+        if len(values) != 3 or any(value < 1 or value > 5 for value in values):
+            await interaction_response(interaction).send_message(
+                "Все три оценки должны быть числами от 1 до 5.", ephemeral=True
+            )
+            return
+        tracker = store.feedback_message(self.session_id)
+        if tracker is None or tracker["status"] != "open":
+            await interaction_response(interaction).send_message(
+                "Этот опрос уже завершён.", ephemeral=True
+            )
+            return
+        store.save_raid_feedback(
+            self.session_id,
+            member.id,
+            values[0],
+            values[1],
+            values[2],
+            str(self.comment).strip(),
+            utc_timestamp(),
+        )
+        await interaction_response(interaction).send_message(
+            "Спасибо! Ответ сохранён анонимно. Повторная отправка обновит вашу оценку.",
+            ephemeral=True,
+        )
+        channel = member.guild.get_channel(int(tracker["channel_id"]))
+        if channel is not None and hasattr(channel, "fetch_message"):
+            try:
+                message = await channel.fetch_message(int(tracker["message_id"]))
+                await message.edit(
+                    content=feedback_content(self.session_id),
+                    view=RaidFeedbackView(self.session_id),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.exception("Не удалось обновить сообщение оценки РТ")
+
+
+class RaidFeedbackView(discord.ui.View):
+    def __init__(self, session_id: int, disabled: bool = False) -> None:
+        super().__init__(timeout=None)
+        self.session_id = session_id
+        button = discord.ui.Button(
+            label="Оценить РТ",
+            emoji="🗳️",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"raid_feedback:{session_id}",
+            disabled=disabled,
+        )
+        button.callback = self._open_modal
+        self.add_item(button)
+
+    async def _open_modal(self, interaction: discord.Interaction) -> None:
+        tracker = store.feedback_message(self.session_id)
+        if tracker is None or tracker["status"] != "open":
+            await interaction_response(interaction).send_message(
+                "Этот опрос уже завершён.", ephemeral=True
+            )
+            return
+        await interaction_response(interaction).send_modal(
+            RaidFeedbackModal(self.session_id)
+        )
 
 
 def utc_timestamp() -> float:
@@ -554,13 +864,63 @@ def raid_vacation_status_text(on_date=None) -> str:
     return f"завершены ({dates})"
 
 
+def runtime_setting(name: str) -> str:
+    saved = store.get_state(f"setting:{name}")
+    if saved is not None:
+        return saved
+    if name == "raid_announcement_channel":
+        return str(config.RAID_ANNOUNCEMENT_CHANNEL_ID)
+    if name == "raid_analysis_channel":
+        return str(config.RAID_ANALYSIS_CHANNEL_ID)
+    if name == "raid_feedback_channel":
+        return str(config.FLOOD_CHANNEL_ID)
+    return SETTING_SPECS[name].default
+
+
+def runtime_setting_int(name: str) -> int:
+    return int(runtime_setting(name))
+
+
+def runtime_setting_time(name: str):
+    return datetime.strptime(runtime_setting(name), "%H:%M").time()
+
+
+def raid_schedule_origin(on_date) -> Optional[str]:
+    date_key = on_date.isoformat()
+    moved_here = store.raid_move_to_date(date_key)
+    if moved_here is not None:
+        return str(moved_here["raid_date"])
+    if on_date.weekday() not in (4, 6):
+        return None
+    exception = store.raid_schedule_exception(date_key)
+    if exception is not None and exception["action"] in ("cancelled", "moved"):
+        return None
+    return date_key
+
+
+def is_planned_raid_date(on_date) -> bool:
+    return raid_schedule_origin(on_date) is not None
+
+
+def schedule_origin_for_input(on_date) -> str:
+    moved_here = store.raid_move_to_date(on_date.isoformat())
+    return str(moved_here["raid_date"]) if moved_here else on_date.isoformat()
+
+
+def schedule_actual_date(origin: str) -> str:
+    exception = store.raid_schedule_exception(origin)
+    if exception is not None and exception["action"] == "moved":
+        return str(exception["replacement_date"])
+    return origin
+
+
 def next_main_raid_date(now: Optional[datetime] = None) -> datetime:
     current = now or datetime.now(MSK)
-    if current.weekday() in (4, 6):
+    if is_planned_raid_date(current.date()):
         return current.replace(hour=0, minute=0, second=0, microsecond=0)
-    for days_ahead in range(1, 8):
+    for days_ahead in range(1, 32):
         candidate = current + timedelta(days=days_ahead)
-        if candidate.weekday() in (4, 6):
+        if is_planned_raid_date(candidate.date()):
             return candidate.replace(hour=0, minute=0, second=0, microsecond=0)
     raise RuntimeError("Не удалось определить ближайшее РТ")
 
@@ -583,8 +943,8 @@ def raid_date_from_notice(content: str) -> datetime:
         raise ValueError("В сообщении указана некорректная дата") from error
     if not year_text and result.date() < now.date() - timedelta(days=1):
         result = result.replace(year=year + 1)
-    if result.weekday() not in (4, 6):
-        raise ValueError("Указанная дата не является пятницей или воскресеньем")
+    if not is_planned_raid_date(result.date()):
+        raise ValueError("На указанную дату РТ не запланировано")
     return result
 
 
@@ -641,12 +1001,12 @@ def recalculate_after_notice_removal(raid_date: str, member_id: int) -> None:
     planned_start, planned_end = raid_window(raid_date)
     minimum_seconds = (
         (planned_end - planned_start).total_seconds()
-        * config.RAID_MIN_ATTENDANCE_PERCENT
+        * runtime_setting_int("raid_attendance_percent")
         / 100
     )
     if record["present_seconds"] >= minimum_seconds:
         late_boundary = (
-            planned_start + timedelta(minutes=config.RAID_LATE_AFTER_MINUTES)
+            planned_start + timedelta(minutes=runtime_setting_int("raid_late_minutes"))
         ).timestamp()
         status = (
             "late"
@@ -698,10 +1058,16 @@ async def reconcile_raid_notice_reactions() -> None:
 
 def raid_window(raid_date: str) -> tuple[datetime, datetime]:
     date_value = datetime.strptime(raid_date, "%Y-%m-%d").replace(tzinfo=MSK)
-    start = date_value.replace(hour=21, minute=0, second=0, microsecond=0)
-    end = (start + timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
+    start_time = runtime_setting_time("raid_start_time")
+    end_time = runtime_setting_time("raid_end_time")
+    start = date_value.replace(
+        hour=start_time.hour, minute=start_time.minute, second=0, microsecond=0
     )
+    end = date_value.replace(
+        hour=end_time.hour, minute=end_time.minute, second=0, microsecond=0
+    )
+    if end <= start:
+        end += timedelta(days=1)
     return start, end
 
 
@@ -768,10 +1134,10 @@ async def finish_raid_attendance(
         planned_start, planned_end = raid_window(session["raid_date"])
         planned_seconds = (planned_end - planned_start).total_seconds()
         minimum_seconds = (
-            planned_seconds * config.RAID_MIN_ATTENDANCE_PERCENT / 100
+            planned_seconds * runtime_setting_int("raid_attendance_percent") / 100
         )
         late_boundary = (
-            planned_start + timedelta(minutes=config.RAID_LATE_AFTER_MINUTES)
+            planned_start + timedelta(minutes=runtime_setting_int("raid_late_minutes"))
         ).timestamp()
 
         counts = {key: 0 for key in ATTENDANCE_STATUS_LABELS}
@@ -827,7 +1193,9 @@ async def finish_raid_attendance(
             max(end_timestamp, utc_timestamp())
             + config.WARCRAFTLOGS_REPORT_DELAY_MINUTES * 60,
         )
-        announcement_channel = bot.get_channel(config.RAID_ANNOUNCEMENT_CHANNEL_ID)
+        announcement_channel = bot.get_channel(
+            runtime_setting_int("raid_announcement_channel")
+        )
         if announcement_channel and hasattr(announcement_channel, "send"):
             await announcement_channel.send(
                 f"📊 Черновик посещаемости РТ за {session['raid_date']} готов. "
@@ -839,6 +1207,7 @@ async def finish_raid_attendance(
                 "Проверьте `/attendance_current` и подтвердите "
                 "через `/attendance_confirm`."
             )
+        await publish_raid_feedback_survey(session_id)
         logger.info("РТ-сессия %s переведена в черновик", session_id)
         return session_id, counts
 
@@ -855,8 +1224,8 @@ async def reconcile_raid_attendance(guild: discord.Guild) -> None:
                 int(active["id"]), raid_voice_member_ids(guild), utc_timestamp()
             )
         return
-    if now.weekday() in (4, 6) and now.hour >= 21:
-        planned_start = now.replace(hour=21, minute=0, second=0, microsecond=0)
+    planned_start, planned_end = raid_window(now.date().isoformat())
+    if is_planned_raid_date(now.date()) and planned_start <= now < planned_end:
         try:
             await start_raid_attendance(
                 guild,
@@ -878,31 +1247,85 @@ async def attendance_heartbeat() -> None:
     )
 
 
-@tasks.loop(time=datetime.min.replace(hour=21, minute=0, tzinfo=MSK).timetz())
+@tasks.loop(minutes=1)
 async def scheduled_attendance_start() -> None:
     now = datetime.now(MSK)
     guild = bot.get_guild(config.GUILD_ID)
-    if guild is None or now.weekday() not in (4, 6):
+    planned_start, planned_end = raid_window(now.date().isoformat())
+    if (
+        guild is None
+        or not is_planned_raid_date(now.date())
+        or not planned_start <= now < planned_end
+    ):
         return
-    store.set_state("last_attendance_start_attempt", now.isoformat())
+    date_key = now.date().isoformat()
+    if store.get_state("last_attendance_start_attempt") == date_key:
+        return
+    store.set_state("last_attendance_start_attempt", date_key)
     try:
         await start_raid_attendance(
             guild,
-            raid_date=now.date().isoformat(),
-            started_at=now.replace(hour=21, minute=0, second=0, microsecond=0).timestamp(),
+            raid_date=date_key,
+            started_at=planned_start.timestamp(),
         )
     except ValueError:
         logger.warning("Сессия посещаемости за сегодня уже существует")
 
 
-@tasks.loop(time=datetime.min.replace(hour=0, minute=0, tzinfo=MSK).timetz())
+@tasks.loop(minutes=1)
 async def scheduled_attendance_end() -> None:
     now = datetime.now(MSK)
-    guild = bot.get_guild(config.GUILD_ID)
-    if guild is None or now.weekday() not in (0, 5):
+    session = store.active_raid_session()
+    if session is None:
         return
-    store.set_state("last_attendance_end_attempt", now.isoformat())
+    _, planned_end = raid_window(str(session["raid_date"]))
+    if now < planned_end:
+        return
+    store.set_state("last_attendance_end_attempt", now.date().isoformat())
     await finish_raid_attendance()
+
+
+async def publish_raid_feedback_survey(session_id: int) -> None:
+    if store.feedback_message(session_id) is not None:
+        return
+    channel = bot.get_channel(runtime_setting_int("raid_feedback_channel"))
+    if channel is None or not hasattr(channel, "send"):
+        logger.error("Канал анонимной оценки РТ не найден")
+        return
+    try:
+        message = await channel.send(
+            feedback_content(session_id),
+            view=RaidFeedbackView(session_id),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("Не удалось опубликовать анонимную оценку РТ")
+        return
+    store.save_feedback_message(
+        session_id, message.id, channel.id, utc_timestamp()
+    )
+
+
+@tasks.loop(hours=1)
+async def check_feedback_surveys() -> None:
+    cutoff = utc_timestamp() - 48 * 3600
+    guild = bot.get_guild(config.GUILD_ID)
+    if guild is None:
+        return
+    for tracker in store.open_feedback_messages():
+        if float(tracker["created_at"]) > cutoff:
+            continue
+        channel = guild.get_channel(int(tracker["channel_id"]))
+        if channel is not None and hasattr(channel, "fetch_message"):
+            try:
+                message = await channel.fetch_message(int(tracker["message_id"]))
+                await message.edit(
+                    content=feedback_content(int(tracker["session_id"]), closed=True),
+                    view=RaidFeedbackView(int(tracker["session_id"]), disabled=True),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.exception("Не удалось закрыть опрос РТ")
+        store.close_feedback_message(int(tracker["session_id"]))
 
 
 def backup_files() -> list[Path]:
@@ -986,6 +1409,174 @@ async def fetch_wowaudit_loot(
         store.set_state("last_wowaudit_error", "")
         store.set_state("wowaudit_failure_count", "0")
         return result
+
+
+def previous_week_period(now: Optional[datetime] = None) -> tuple[object, object]:
+    current = (now or datetime.now(MSK)).date()
+    this_monday = current - timedelta(days=current.weekday())
+    end = this_monday - timedelta(days=1)
+    start = end - timedelta(days=6)
+    return start, end
+
+
+async def weekly_raid_report_lines(
+    guild: discord.Guild, start, end
+) -> list[str]:
+    sessions = store.weekly_raid_sessions(start.isoformat(), end.isoformat())
+    rows = store.attendance_between(start.isoformat(), end.isoformat())
+    status_counts = {
+        status: sum(row["status"] == status for row in rows)
+        for status in ATTENDANCE_STATUS_LABELS
+    }
+    eligible = sum(row["status"] != "excused" for row in rows)
+    credited = sum(
+        row["status"] in ("present", "late", "reserve")
+        for row in rows
+        if row["status"] != "excused"
+    )
+    attendance_percent = credited / eligible * 100 if eligible else 100.0
+    late_members: dict[int, int] = {}
+    absent_members: dict[int, int] = {}
+    for row in rows:
+        member_id = int(row["member_id"])
+        if row["status"] == "late":
+            late_members[member_id] = late_members.get(member_id, 0) + 1
+        elif row["status"] == "absent":
+            absent_members[member_id] = absent_members.get(member_id, 0) + 1
+
+    boss_stats: dict[str, dict[str, object]] = {}
+    total_pulls = 0
+    total_kills = 0
+    for session in sessions:
+        report_code = str(session["report_code"] or "")
+        if not report_code or not warcraftlogs.configured:
+            continue
+        try:
+            report = await warcraftlogs.report(report_code)
+        except WarcraftLogsAPIError:
+            logger.warning("Не удалось получить недельный отчёт WCL %s", report_code)
+            continue
+        for fight in report.fights:
+            if int(fight.get("encounterID") or 0) <= 0:
+                continue
+            total_pulls += 1
+            name = str(fight.get("name") or "Неизвестный босс")
+            stats = boss_stats.setdefault(
+                name, {"pulls": 0, "kills": 0, "best": None}
+            )
+            stats["pulls"] = int(stats["pulls"]) + 1
+            if fight.get("kill"):
+                stats["kills"] = int(stats["kills"]) + 1
+                total_kills += 1
+            elif fight.get("fightPercentage") is not None:
+                percentage = float(fight["fightPercentage"])
+                current_best = stats["best"]
+                stats["best"] = (
+                    percentage
+                    if current_best is None
+                    else min(float(current_best), percentage)
+                )
+
+    feedback_responses = 0
+    feedback_totals = {"organization": 0.0, "pace": 0.0, "atmosphere": 0.0}
+    comments: list[str] = []
+    for session in sessions:
+        summary = store.raid_feedback_summary(int(session["id"]))
+        amount = int(summary["responses"] or 0)
+        if amount:
+            feedback_responses += amount
+            for key in feedback_totals:
+                feedback_totals[key] += float(summary[key]) * amount
+        comments.extend(store.raid_feedback_comments(int(session["id"])))
+
+    lines = [
+        f"📆 **Недельная сводка РТ · {start.strftime('%d.%m')}–{end.strftime('%d.%m.%Y')}**",
+        f"Проведено РТ: **{len(sessions)}** · общая посещаемость: "
+        f"**{attendance_percent:.0f}% ({credited}/{eligible})**.",
+        "Отметки: "
+        f"присутствовали — {status_counts.get('present', 0)}, "
+        f"опоздали — {status_counts.get('late', 0)}, "
+        f"резерв — {status_counts.get('reserve', 0)}, "
+        f"предупредили — {status_counts.get('excused', 0)}, "
+        f"отсутствовали — {status_counts.get('absent', 0)}.",
+    ]
+
+    def member_counts(values: dict[int, int]) -> str:
+        rendered = []
+        for member_id, amount in sorted(values.items(), key=lambda item: (-item[1], item[0]))[:8]:
+            member = guild.get_member(member_id)
+            rendered.append(f"{member.display_name if member else member_id} — {amount}")
+        return ", ".join(rendered)
+
+    if late_members:
+        lines.append("🕐 Опоздания: " + member_counts(late_members))
+    if absent_members:
+        lines.append("❌ Пропуски без предупреждения: " + member_counts(absent_members))
+    if total_pulls:
+        lines.append(
+            f"⚔️ Warcraft Logs: **{total_kills} убийств / {total_pulls} пуллов**."
+        )
+    problem_bosses = sorted(
+        (
+            (name, stats)
+            for name, stats in boss_stats.items()
+            if int(stats["pulls"]) - int(stats["kills"]) > 0
+        ),
+        key=lambda item: (
+            -(int(item[1]["pulls"]) - int(item[1]["kills"])),
+            item[0].casefold(),
+        ),
+    )
+    if problem_bosses:
+        lines.append("\n🔥 **Проблемные боссы:**")
+        for name, stats in problem_bosses[:8]:
+            wipes = int(stats["pulls"]) - int(stats["kills"])
+            best = stats["best"]
+            progress = f" · лучший пул {float(best):.1f}%" if best is not None else ""
+            lines.append(
+                f"• **{name}** — {wipes} вайпов, {int(stats['kills'])} убийств{progress}"
+            )
+    if feedback_responses:
+        lines.append(
+            "\n🗳️ **Анонимная оценка недели:** "
+            f"ответов — {feedback_responses}, "
+            f"организация — {feedback_totals['organization'] / feedback_responses:.1f}/5, "
+            f"темп — {feedback_totals['pace'] / feedback_responses:.1f}/5, "
+            f"атмосфера — {feedback_totals['atmosphere'] / feedback_responses:.1f}/5."
+        )
+    if comments:
+        lines.append("**Анонимные комментарии:**")
+        lines.extend(f"• {comment[:500]}" for comment in comments[:8])
+    return lines
+
+
+async def publish_weekly_raid_report(start, end) -> bool:
+    guild = bot.get_guild(config.GUILD_ID)
+    if guild is None:
+        return False
+    sessions = store.weekly_raid_sessions(start.isoformat(), end.isoformat())
+    if not sessions:
+        return False
+    channel = guild.get_channel(runtime_setting_int("raid_analysis_channel"))
+    if channel is None or not hasattr(channel, "send"):
+        return False
+    await send_channel_chunks(
+        channel, await weekly_raid_report_lines(guild, start, end)
+    )
+    return True
+
+
+@tasks.loop(minutes=10)
+async def scheduled_weekly_raid_report() -> None:
+    now = datetime.now(MSK)
+    if now.weekday() != 0 or now.time() < datetime.min.replace(hour=12).time():
+        return
+    start, end = previous_week_period(now)
+    state_key = f"weekly_raid_report:{start.isoformat()}"
+    if store.get_state(state_key) is not None:
+        return
+    if await publish_weekly_raid_report(start, end):
+        store.set_state(state_key, datetime.now(MSK).isoformat())
 
 
 def format_loot_timestamp(value: str) -> str:
@@ -1537,6 +2128,300 @@ async def synchronize_guild_roles(
         return True, len(roster), changed
 
 
+def supporters_message_content(guild: discord.Guild) -> str:
+    booster_role = guild.get_role(config.NITRO_BOOSTER_ROLE_ID)
+    boosters = sorted(
+        booster_role.members if booster_role else [],
+        key=lambda member: (member.display_name.casefold(), member.id),
+    )
+    booster_lines = (
+        "\n".join(f"• {member.mention}" for member in boosters)
+        if boosters
+        else "• Сейчас активных бустеров нет."
+    )
+    return (
+        "# 💜 БЛАГОДАРНОСТИ\n\n"
+        "> Эти люди помогают Shadow Squad оплачивать инструменты и развивать Discord-сервер.\n\n"
+        "## ⏱️ TIMELINE REMINDER\n"
+        f"<@{config.MIVIVAN_USER_ID}> — оплачивает гильдейскую лицензию Timeline Reminder.\n\n"
+        "## ☁️ ARCHON APP\n"
+        f"<@{config.KELSARAN_USER_ID}> — оплачивает облачное хранилище Archon App.\n\n"
+        "## 🚀 БУСТЫ DISCORD-СЕРВЕРА\n"
+        f"{booster_lines}\n\n"
+        "Спасибо каждому, кто поддерживает сервер бустами 💜\n\n"
+        "*Список бустеров обновляется автоматически.*"
+    )
+
+
+async def refresh_supporters_message(guild: discord.Guild) -> None:
+    channel = guild.get_channel(config.SUPPORTERS_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        logger.error(
+            "Канал благодарностей %s не найден или не является текстовым",
+            config.SUPPORTERS_CHANNEL_ID,
+        )
+        return
+
+    async with supporters_message_lock:
+        content = supporters_message_content(guild)
+        message: Optional[discord.Message] = None
+        stored_message_id = store.get_state(SUPPORTERS_MESSAGE_STATE)
+        if stored_message_id:
+            try:
+                message = await channel.fetch_message(int(stored_message_id))
+            except (ValueError, discord.NotFound):
+                store.delete_state(SUPPORTERS_MESSAGE_STATE)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("Не удалось получить сообщение благодарностей")
+                return
+
+        try:
+            if message is None:
+                message = await channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                store.set_state(SUPPORTERS_MESSAGE_STATE, str(message.id))
+            elif message.content != content:
+                await message.edit(
+                    content=content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            if not message.pinned:
+                await message.pin(reason="Постоянное сообщение благодарностей Shadow Squad")
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Не удалось создать или обновить сообщение благодарностей")
+
+
+def timeline_archive_attachment(
+    message: discord.Message,
+) -> Optional[discord.Attachment]:
+    return next(
+        (
+            attachment
+            for attachment in reversed(message.attachments)
+            if is_timeline_archive(attachment.filename)
+        ),
+        None,
+    )
+
+
+def can_publish_timeline_archive(member: discord.Member) -> bool:
+    role_ids = {role.id for role in member.roles}
+    return (
+        member.id == config.FRZOK_USER_ID
+        or member.guild_permissions.administrator
+        or bool(role_ids & OFFICER_COMMAND_ROLE_IDS)
+    )
+
+
+def timeline_status_content(
+    source: discord.Message,
+    attachment: discord.Attachment,
+) -> str:
+    version = extract_timeline_version(source.content, attachment.filename)
+    version_text = version or "не указана в названии файла или сообщении"
+    return (
+        "# 📦 АКТУАЛЬНЫЙ TIMELINE REMINDER\n\n"
+        f"**Версия:** {version_text}\n"
+        f"**Архив:** `{attachment.filename}`\n"
+        f"**Опубликовал:** {source.author.mention}\n"
+        f"**Обновлено:** <t:{int(source.created_at.timestamp())}:F>\n\n"
+        f"➡️ [Скачать актуальный архив]({source.jump_url})\n\n"
+        "При следующей загрузке архива `.zip`, `.rar` или `.7z` "
+        "это сообщение обновится автоматически. Для определения версии "
+        "укажите её в тексте сообщения или имени файла, например `v353`."
+    )
+
+
+async def refresh_timeline_archive(
+    source: discord.Message,
+    *,
+    acknowledge: bool,
+) -> bool:
+    attachment = timeline_archive_attachment(source)
+    if attachment is None:
+        return False
+    async with timeline_update_lock:
+        if store.get_state(TIMELINE_SOURCE_MESSAGE_STATE) == str(source.id):
+            return False
+        status_message: Optional[discord.Message] = None
+        stored_message_id = store.get_state(TIMELINE_STATUS_MESSAGE_STATE)
+        if stored_message_id:
+            try:
+                status_message = await source.channel.fetch_message(
+                    int(stored_message_id)
+                )
+            except (ValueError, discord.NotFound):
+                store.delete_state(TIMELINE_STATUS_MESSAGE_STATE)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("Не удалось получить статус Timeline Reminder")
+                return False
+        content = timeline_status_content(source, attachment)
+        try:
+            if status_message is None:
+                status_message = await source.channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                store.set_state(
+                    TIMELINE_STATUS_MESSAGE_STATE, str(status_message.id)
+                )
+            else:
+                await status_message.edit(
+                    content=content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            if not status_message.pinned:
+                await status_message.pin(
+                    reason="Автоматически обновляемая версия Timeline Reminder"
+                )
+            store.set_state(TIMELINE_SOURCE_MESSAGE_STATE, str(source.id))
+            if acknowledge:
+                await source.reply(
+                    "✅ Архив назначен актуальной версией Timeline Reminder. "
+                    "Закреплённое сообщение обновлено.",
+                    mention_author=False,
+                )
+                await send_sync_log(
+                    [
+                        "📦 **Timeline Reminder обновлён автоматически**",
+                        f"Файл: `{attachment.filename}`",
+                        f"Источник: {source.jump_url}",
+                    ]
+                )
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Не удалось обновить актуальную версию Timeline Reminder")
+            return False
+
+
+async def reconcile_timeline_archive(guild: discord.Guild) -> None:
+    channel = guild.get_thread(config.TIMELINE_REMINDER_THREAD_ID)
+    if channel is None:
+        try:
+            fetched = await bot.fetch_channel(config.TIMELINE_REMINDER_THREAD_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.exception("Тема Timeline Reminder не найдена")
+            return
+        if not isinstance(fetched, discord.Thread):
+            logger.error("Настроенный канал Timeline Reminder не является темой форума")
+            return
+        channel = fetched
+    try:
+        async for message in channel.history(limit=100):
+            if timeline_archive_attachment(message) is not None:
+                await refresh_timeline_archive(message, acknowledge=False)
+                return
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("Не удалось проверить текущий архив Timeline Reminder")
+
+
+async def published_link_sources(
+    guild: discord.Guild,
+) -> list[tuple[str, str]]:
+    sources = [
+        ("приветствие гостя", config.MESSAGES["GUEST_WELCOME_MESSAGE"]),
+        ("приветствие сержанта", config.MESSAGES["WELCOME_MESSAGE"]),
+    ]
+    channels: list[Any] = []
+    start_channel = guild.get_channel(config.START_HERE_CHANNEL_ID)
+    if start_channel is not None:
+        channels.append(start_channel)
+    for forum_id in (config.RAID_TOOLS_FORUM_ID, config.TACTICS_CHANNEL_ID):
+        forum = guild.get_channel(forum_id)
+        if not isinstance(forum, discord.ForumChannel):
+            continue
+        known_threads = {thread.id: thread for thread in forum.threads}
+        try:
+            async for thread in forum.archived_threads(limit=100):
+                known_threads.setdefault(thread.id, thread)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Не удалось получить архивные темы форума %s", forum_id)
+        channels.extend(known_threads.values())
+    for channel in channels:
+        if not hasattr(channel, "history"):
+            continue
+        try:
+            async for message in channel.history(limit=100):
+                if message.content:
+                    sources.append((message.jump_url, message.content))
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Не удалось проверить ссылки в канале %s", channel.id)
+    return sources
+
+
+async def broken_published_links(guild: discord.Guild) -> list[str]:
+    targets: dict[tuple[int, int, Optional[int], str], str] = {}
+    for source_label, content in await published_link_sources(guild):
+        for target in discord_link_targets(content):
+            targets.setdefault(target, source_label)
+    channel_cache: dict[int, Any] = {}
+    broken: list[str] = []
+    for (guild_id, channel_id, message_id, url), source_label in targets.items():
+        if guild_id != guild.id:
+            continue
+        channel = channel_cache.get(channel_id)
+        if channel_id not in channel_cache:
+            channel = bot.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await bot.fetch_channel(channel_id)
+                except discord.NotFound:
+                    broken.append(f"удалён канал — {url} (источник: {source_label})")
+                    channel_cache[channel_id] = None
+                    continue
+                except discord.Forbidden:
+                    broken.append(f"нет доступа — {url} (источник: {source_label})")
+                    channel_cache[channel_id] = None
+                    continue
+                except discord.HTTPException as error:
+                    logger.warning("Не удалось проверить Discord-ссылку %s: %s", url, error)
+                    continue
+            channel_cache[channel_id] = channel
+        if channel is None or message_id is None:
+            continue
+        if not hasattr(channel, "fetch_message"):
+            broken.append(f"неверный тип ссылки — {url} (источник: {source_label})")
+            continue
+        try:
+            await channel.fetch_message(message_id)
+        except discord.NotFound:
+            broken.append(f"удалено сообщение — {url} (источник: {source_label})")
+        except discord.Forbidden:
+            broken.append(f"нет доступа — {url} (источник: {source_label})")
+        except discord.HTTPException as error:
+            logger.warning("Не удалось проверить Discord-ссылку %s: %s", url, error)
+    return sorted(set(broken))
+
+
+async def run_published_link_check(guild: discord.Guild) -> None:
+    async with published_link_check_lock:
+        broken = await broken_published_links(guild)
+        fingerprint = hashlib.sha256("\n".join(broken).encode("utf-8")).hexdigest()
+        previous = store.get_state(PUBLISHED_LINKS_STATE)
+        if fingerprint == previous:
+            return
+        if broken:
+            lines = [
+                f"🔗 **Найдены битые Discord-ссылки: {len(broken)}**",
+                *[f"• {item}" for item in broken[:25]],
+            ]
+            if len(broken) > 25:
+                lines.append(f"• …и ещё {len(broken) - 25}")
+        else:
+            lines = ["✅ Проверка опубликованных Discord-ссылок: проблем не найдено."]
+        await send_sync_log(lines)
+        store.set_state(PUBLISHED_LINKS_STATE, fingerprint)
+
+
+@tasks.loop(hours=config.PUBLISHED_LINK_CHECK_INTERVAL_HOURS)
+async def scheduled_published_link_check() -> None:
+    guild = bot.get_guild(config.GUILD_ID)
+    if guild is not None:
+        await run_published_link_check(guild)
+
+
 async def reconcile_persistent_state(guild: discord.Guild) -> None:
     guest_role = guild.get_role(config.GUEST_ROLE_ID)
     tracked_guests = {member_id for member_id, _ in store.guests()}
@@ -1589,12 +2474,33 @@ async def on_ready() -> None:
         return
 
     await reconcile_persistent_state(guild)
+    await refresh_supporters_message(guild)
+    await reconcile_timeline_archive(guild)
     await reconcile_raid_notice_reactions()
     await reconcile_raid_attendance(guild)
+    for session in store.finished_sessions_missing_feedback(
+        utc_timestamp() - 3 * 86400
+    ):
+        await publish_raid_feedback_survey(int(session["id"]))
     for event in store.open_events():
         bot.add_view(
             GuildEventView(int(event["id"])),
             message_id=int(event["message_id"]),
+        )
+    for tracker in store.all_tactics_ack_messages():
+        bot.add_view(
+            TacticsAckView(int(tracker["source_message_id"])),
+            message_id=int(tracker["acknowledgement_message_id"]),
+        )
+    for tracker in store.open_feedback_messages():
+        bot.add_view(
+            RaidFeedbackView(int(tracker["session_id"])),
+            message_id=int(tracker["message_id"]),
+        )
+    for checklist in store.active_sergeant_checklists():
+        bot.add_view(
+            SergeantChecklistView(int(checklist["id"])),
+            message_id=int(checklist["message_id"]),
         )
     if not backup_files():
         try:
@@ -1614,6 +2520,8 @@ async def on_ready() -> None:
         check_guest_roles,
         check_empty_channels,
         check_tactics_reminders,
+        check_feedback_surveys,
+        scheduled_weekly_raid_report,
         check_raid_loot_reports,
         check_warcraftlogs_reports,
         scheduled_raid_reminder,
@@ -1626,6 +2534,7 @@ async def on_ready() -> None:
         scheduled_attendance_start,
         scheduled_attendance_end,
         scheduled_database_backup,
+        scheduled_published_link_check,
     ):
         if not loop.is_running():
             loop.start()
@@ -1684,10 +2593,20 @@ async def on_member_join(member: discord.Member) -> None:
 async def on_member_remove(member: discord.Member) -> None:
     store.remove_guest(member.id)
     store.clear_absence(member.id)
+    if any(role.id == config.NITRO_BOOSTER_ROLE_ID for role in member.roles):
+        await refresh_supporters_message(member.guild)
 
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
+    if (
+        message.guild is not None
+        and message.channel.id == config.TIMELINE_REMINDER_THREAD_ID
+        and timeline_archive_attachment(message) is not None
+        and isinstance(message.author, discord.Member)
+        and can_publish_timeline_archive(message.author)
+    ):
+        await refresh_timeline_archive(message, acknowledge=True)
     if message.author.bot:
         return
     if (
@@ -1703,6 +2622,20 @@ async def on_message(message: discord.Message) -> None:
             + config.TACTICS_REMINDER_DELAY_HOURS * 3600,
             message.created_at.timestamp(),
         )
+        try:
+            acknowledgement = await message.reply(
+                tactics_ack_content(message.guild, message.id),
+                view=TacticsAckView(message.id),
+                mention_author=False,
+            )
+            store.save_tactics_ack_message(
+                message.id,
+                acknowledgement.id,
+                message.channel.id,
+                utc_timestamp(),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Не удалось создать подтверждение тактики")
     if message.channel.id == config.RAID_ABSENCE_CHANNEL_ID:
         try:
             raid_date = raid_date_from_notice(message.content)
@@ -1780,6 +2713,17 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
         revoke_raid_notice(payload.message_id)
     elif payload.channel_id == config.TACTICS_CHANNEL_ID:
         store.remove_tactics_reminder(payload.message_id)
+        tracker = store.remove_tactics_ack_tracker(payload.message_id)
+        if tracker:
+            channel = bot.get_channel(int(tracker["channel_id"]))
+            if channel is not None and hasattr(channel, "fetch_message"):
+                try:
+                    acknowledgement = await channel.fetch_message(
+                        int(tracker["acknowledgement_message_id"])
+                    )
+                    await acknowledgement.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
 
 
 @bot.event
@@ -1792,6 +2736,7 @@ async def on_raw_bulk_message_delete(
     elif payload.channel_id == config.TACTICS_CHANNEL_ID:
         for message_id in payload.message_ids:
             store.remove_tactics_reminder(message_id)
+            store.remove_tactics_ack_tracker(message_id)
 
 
 @tasks.loop(minutes=1)
@@ -1879,11 +2824,29 @@ async def check_tactics_reminders() -> None:
 
         author = guild.get_member(int(reminder["author_id"]))
         author_name = author.display_name if author else "Frzok"
+        acknowledged = store.tactics_acknowledged_members(
+            int(reminder["message_id"])
+        )
+        unread = sorted(
+            (
+                member.display_name
+                for member in eligible_raid_members(guild)
+                if member.id not in acknowledged
+            ),
+            key=str.casefold,
+        )
+        if not unread:
+            store.remove_tactics_reminder(int(reminder["message_id"]))
+            continue
+        unread_text = ", ".join(unread[:25])
+        if len(unread) > 25:
+            unread_text += f" (+ ещё {len(unread) - 25})"
         try:
             await target.send(
                 f"<@&{config.ROLE_IDS['SERGEANT']}> "
                 f"**{author_name}** опубликовала новую тактику по боссам. "
-                "Пожалуйста, ознакомьтесь с ней до ближайшего РТ:\n"
+                "Пожалуйста, ознакомьтесь с ней до ближайшего РТ.\n"
+                f"**Не подтвердили ({len(unread)}):** {unread_text}\n"
                 f"{source_message.jump_url}"
             )
         except (discord.Forbidden, discord.HTTPException):
@@ -2109,6 +3072,60 @@ def warcraftlogs_report_lines(
     return lines
 
 
+async def combined_raid_summary_lines(
+    queued,
+    report: Optional[WarcraftLogsReport],
+    raid_date: str,
+    previous: Optional[WarcraftLogsReport],
+) -> list[str]:
+    session_id = int(queued["session_id"])
+    records = store.attendance_records(session_id)
+    counts = {
+        status: sum(1 for row in records if row["status"] == status)
+        for status in ATTENDANCE_STATUS_LABELS
+    }
+    lines = [
+        f"🏠 **Итоги РТ за {raid_date}**",
+        "Посещаемость: "
+        f"присутствовали — **{counts.get('present', 0)}**, "
+        f"опоздали — **{counts.get('late', 0)}**, "
+        f"резерв — **{counts.get('reserve', 0)}**, "
+        f"предупредили — **{counts.get('excused', 0)}**, "
+        f"отсутствовали — **{counts.get('absent', 0)}**.",
+    ]
+    if wowaudit.configured:
+        try:
+            season_name, items = await fetch_wowaudit_loot()
+            raid_items = [
+                item
+                for item in items
+                if not item.discarded
+                and (awarded_at := parse_loot_timestamp(item.awarded_at)) is not None
+                and float(queued["started_at"])
+                <= awarded_at
+                <= float(queued["ended_at"] or utc_timestamp())
+            ]
+            loot_names = ", ".join(
+                f"{item.name} → {item.recipient_name}"
+                for item in raid_items[:8]
+            )
+            lines.append(
+                f"Лут ({season_name}): **{len(raid_items)} предметов**"
+                + (f" — {loot_names}" if loot_names else ".")
+            )
+        except WoWAuditAPIError:
+            logger.warning("Не удалось добавить WoW Audit в общий итог РТ")
+    if report is None:
+        lines.append(
+            "⚠️ Публичный Warcraft Logs не найден за отведённое время; "
+            "итог опубликован без данных о прогрессе и смертях."
+        )
+    else:
+        detail_lines = warcraftlogs_report_lines(report, raid_date, previous)
+        lines.extend(detail_lines[1:])
+    return lines
+
+
 def warcraftlogs_death_lines(
     report: WarcraftLogsReport, raid_date: str
 ) -> list[str]:
@@ -2188,12 +3205,13 @@ async def check_warcraftlogs_reports() -> None:
     guild = bot.get_guild(config.GUILD_ID)
     if guild is None:
         return
-    channel = guild.get_channel(config.WARCRAFTLOGS_REPORT_CHANNEL_ID)
+    analysis_channel_id = runtime_setting_int("raid_analysis_channel")
+    channel = guild.get_channel(analysis_channel_id)
     if channel is None or not hasattr(channel, "send"):
         await send_health_alert(
             "warcraftlogs_channel",
             "⚠️ Канал отчётов Warcraft Logs "
-            f"`{config.WARCRAFTLOGS_REPORT_CHANNEL_ID}` не найден.",
+            f"`{analysis_channel_id}` не найден.",
         )
         return
 
@@ -2207,10 +3225,8 @@ async def check_warcraftlogs_reports() -> None:
                 ended_at + 2 * 3600,
             )
             if report is None:
-                abandon = (
-                    age
-                    >= config.WARCRAFTLOGS_REPORT_MAX_AGE_HOURS * 3600
-                )
+                missing_hours = runtime_setting_int("wcl_missing_hours")
+                abandon = age >= missing_hours * 3600
                 store.fail_warcraftlogs_report(
                     session_id,
                     "Подходящий публичный лог пока не найден",
@@ -2219,11 +3235,23 @@ async def check_warcraftlogs_reports() -> None:
                     abandon=abandon,
                 )
                 if abandon:
+                    fallback_key = f"raid_summary_fallback:{session_id}"
+                    if store.get_state(fallback_key) is None:
+                        fallback_date = datetime.strptime(
+                            str(queued["raid_date"]), "%Y-%m-%d"
+                        ).strftime("%d.%m.%Y")
+                        await send_channel_chunks(
+                            channel,
+                            await combined_raid_summary_lines(
+                                queued, None, fallback_date, None
+                            ),
+                        )
+                        store.set_state(fallback_key, datetime.now(MSK).isoformat())
                     await send_health_alert(
                         f"warcraftlogs_missing:{session_id}",
                         "⚠️ Warcraft Logs не нашёл публичный отчёт "
                         f"за РТ {queued['raid_date']} в течение "
-                        f"{config.WARCRAFTLOGS_REPORT_MAX_AGE_HOURS} ч.",
+                        f"{missing_hours} ч.",
                         cooldown_minutes=24 * 60,
                     )
                 continue
@@ -2240,7 +3268,9 @@ async def check_warcraftlogs_reports() -> None:
                 )
             await send_channel_chunks(
                 channel,
-                warcraftlogs_report_lines(report, raid_date, previous),
+                await combined_raid_summary_lines(
+                    queued, report, raid_date, previous
+                ),
             )
             store.complete_warcraftlogs_report(
                 session_id, report.code, utc_timestamp()
@@ -2448,10 +3478,16 @@ def raid_start_announcement_content(
 
 
 def raid_reminder_is_due(now: datetime) -> bool:
-    if now.weekday() not in (4, 6):
+    if not is_planned_raid_date(now.date()):
         return False
-    start = now.replace(hour=20, minute=30, second=0, microsecond=0)
-    cutoff = now.replace(hour=21, minute=0, second=0, microsecond=0)
+    announcement_time = runtime_setting_time("raid_announcement_time")
+    start = now.replace(
+        hour=announcement_time.hour,
+        minute=announcement_time.minute,
+        second=0,
+        microsecond=0,
+    )
+    cutoff, _ = raid_window(now.date().isoformat())
     return start <= now < cutoff
 
 
@@ -2468,11 +3504,12 @@ async def scheduled_raid_reminder() -> None:
     reminder_key = now.date().isoformat()
     if store.get_state("last_reminder_date") == reminder_key:
         return
-    channel = bot.get_channel(config.REMINDER_CHANNEL_ID)
+    announcement_channel_id = runtime_setting_int("raid_announcement_channel")
+    channel = bot.get_channel(announcement_channel_id)
     if channel is None or not hasattr(channel, "send"):
         logger.error(
             "Канал автоматического объявления РТ %s не найден",
-            config.REMINDER_CHANNEL_ID,
+            announcement_channel_id,
         )
         return
     try:
@@ -2488,17 +3525,23 @@ async def scheduled_raid_reminder() -> None:
     store.set_state("last_reminder_date", reminder_key)
     logger.info(
         "Автоматическое объявление РТ опубликовано в канале %s",
-        config.REMINDER_CHANNEL_ID,
+        announcement_channel_id,
     )
 
 
 @tasks.loop(minutes=1)
 async def scheduled_absence_reminder() -> None:
     now = datetime.now(MSK)
-    if now.weekday() not in (4, 6):
+    if not is_planned_raid_date(now.date()):
         return
-    start = now.replace(hour=20, minute=30, second=0, microsecond=0)
-    cutoff = now.replace(hour=21, minute=0, second=0, microsecond=0)
+    announcement_time = runtime_setting_time("raid_announcement_time")
+    start = now.replace(
+        hour=announcement_time.hour,
+        minute=announcement_time.minute,
+        second=0,
+        microsecond=0,
+    )
+    cutoff, _ = raid_window(now.date().isoformat())
     if not start <= now < cutoff:
         return
     date_key = now.date().isoformat()
@@ -2655,10 +3698,42 @@ async def scheduled_health_check() -> None:
             cooldown_minutes=24 * 60,
         )
 
+    stale_hours = runtime_setting_int("blizzard_stale_hours")
+    if (
+        last_sync_success is None
+        or now - last_sync_success >= timedelta(hours=stale_hours)
+    ):
+        last_text = (
+            last_sync_success.strftime("%d.%m.%Y %H:%M МСК")
+            if last_sync_success
+            else "успешных обновлений ещё не было"
+        )
+        await send_health_alert(
+            "blizzard_roster_stale",
+            "⚠️ Состав Blizzard давно не обновлялся: "
+            f"последнее успешное обновление — **{last_text}**, "
+            f"порог — {stale_hours} ч.",
+            cooldown_minutes=stale_hours * 60,
+        )
+
+    minimum_lates = runtime_setting_int("frequent_late_count")
+    late_window = runtime_setting_int("frequent_late_window")
+    guild = bot.get_guild(config.GUILD_ID)
+    if guild is not None:
+        for row in store.frequent_late_members(minimum_lates, late_window):
+            member = guild.get_member(int(row["member_id"]))
+            if member is None or not is_eligible_raid_member(member):
+                continue
+            await send_health_alert(
+                f"frequent_late:{member.id}:{row['latest_raid_date']}",
+                f"🕐 **{member.display_name}** часто опаздывает: "
+                f"**{row['lates']} из последних {row['raids']} РТ**.",
+                cooldown_minutes=365 * 24 * 60,
+            )
+
     today = now.date().isoformat()
-    if now.weekday() in (4, 6) and now.time() >= datetime.min.replace(
-        hour=21, minute=0
-    ).time():
+    planned_start, planned_end = raid_window(today)
+    if is_planned_raid_date(now.date()) and now >= planned_start:
         if (
             not raid_announcements_paused(now.date())
             and store.get_state("last_reminder_date") != today
@@ -2677,8 +3752,7 @@ async def scheduled_health_check() -> None:
                 cooldown_minutes=24 * 60,
             )
         if (
-            now.time()
-            >= datetime.min.replace(hour=21, minute=15).time()
+            now >= planned_start + timedelta(minutes=15)
             and not store.raid_session_by_date(today)
         ):
             await send_health_alert(
@@ -2720,6 +3794,48 @@ async def scheduled_health_check() -> None:
             "⏰ Недельная статистика не была сброшена в среду в 05:00.",
             cooldown_minutes=7 * 24 * 60,
         )
+
+
+@bot.tree.command(name="где", description="Найти нужный канал, форум или инструкцию")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@app_commands.describe(запрос="Например: Timeline, тактики, опоздание или логи")
+async def where_command(
+    interaction: discord.Interaction,
+    запрос: app_commands.Range[str, 1, 60],
+) -> None:
+    matches = find_navigation_entries(str(запрос), limit=5)
+    if not matches:
+        await interaction_response(interaction).send_message(
+            "Ничего не нашёл. Попробуйте: `аддоны`, `тактики`, `Timeline`, "
+            "`опоздание`, `лут`, `логи` или `разборы`.",
+            ephemeral=True,
+        )
+        return
+    lines = [f"🔎 **Результаты по запросу «{запрос}»:**"]
+    lines.extend(
+        f"• [{entry.title}]({entry.url}) — {entry.description}"
+        for entry in matches
+    )
+    await interaction_response(interaction).send_message(
+        "\n".join(lines), ephemeral=True
+    )
+
+
+@where_command.autocomplete("запрос")
+async def where_autocomplete(
+    _interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    entries = (
+        find_navigation_entries(current, limit=20)
+        if current.strip()
+        else list(NAVIGATION_ENTRIES[:20])
+    )
+    return [
+        app_commands.Choice(name=entry.title[:100], value=entry.key)
+        for entry in entries
+    ]
 
 
 @bot.tree.command(name="pidor_of_the_day", description="Выбрать участника дня")
@@ -2819,9 +3935,9 @@ async def absence(
     except ValueError as error:
         await interaction_response(interaction).send_message(str(error), ephemeral=True)
         return
-    if parsed.weekday() not in (4, 6):
+    if not is_planned_raid_date(parsed.date()):
         await interaction_response(interaction).send_message(
-            "Основные РТ проходят только по пятницам и воскресеньям.",
+            "На указанную дату РТ не запланировано или оно отменено.",
             ephemeral=True,
         )
         return
@@ -2982,7 +4098,8 @@ async def attendance_start(
             await interaction_response(interaction).send_message(str(error), ephemeral=True)
             return
         date_key = parsed.date().isoformat()
-        start_at = parsed.replace(hour=21, minute=0).timestamp()
+        planned_start, _ = raid_window(date_key)
+        start_at = planned_start.timestamp()
     else:
         date_key = datetime.now(MSK).date().isoformat()
         start_at = utc_timestamp()
@@ -3873,7 +4990,7 @@ async def publish_raid_announcement(
     interaction: discord.Interaction,
     content: str,
 ) -> None:
-    channel = bot.get_channel(config.RAID_ANNOUNCEMENT_CHANNEL_ID)
+    channel = bot.get_channel(runtime_setting_int("raid_announcement_channel"))
     if channel is None or not hasattr(channel, "send"):
         await interaction.followup.send(
             "Канал для объявления сбора не найден.", ephemeral=True
@@ -3882,6 +4999,379 @@ async def publish_raid_announcement(
     await channel.send(content)
     await interaction.followup.send(
         f"Объявление опубликовано в {channel.mention}.", ephemeral=True
+    )
+
+
+async def publish_raid_schedule_change(content: str) -> bool:
+    channel = bot.get_channel(runtime_setting_int("raid_announcement_channel"))
+    if channel is None or not hasattr(channel, "send"):
+        return False
+    try:
+        await channel.send(
+            f"<@&{config.ROLE_IDS['SERGEANT']}> {content}",
+            allowed_mentions=discord.AllowedMentions(
+                users=False, roles=True, everyone=False
+            ),
+        )
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("Не удалось опубликовать изменение календаря РТ")
+        return False
+
+
+@bot.tree.command(name="rt_cancel", description="Отменить конкретное РТ")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+@app_commands.describe(
+    raid_date="Дата РТ в формате ДД.ММ.ГГГГ",
+    reason="Причина отмены",
+)
+async def rt_cancel(
+    interaction: discord.Interaction,
+    raid_date: str,
+    reason: Optional[str] = None,
+) -> None:
+    try:
+        parsed = parse_user_date(raid_date)
+    except ValueError as error:
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
+        return
+    origin = schedule_origin_for_input(parsed)
+    if parsed < datetime.now(MSK).date():
+        await interaction_response(interaction).send_message(
+            "Нельзя отменить уже прошедшее РТ.", ephemeral=True
+        )
+        return
+    if parsed.weekday() not in (4, 6) and origin == parsed.isoformat():
+        await interaction_response(interaction).send_message(
+            "На эту дату обычное или перенесённое РТ не запланировано.",
+            ephemeral=True,
+        )
+        return
+    session = store.raid_session_by_date(schedule_actual_date(origin))
+    if session is not None:
+        await interaction_response(interaction).send_message(
+            "Для этой даты уже существует сессия посещаемости — отменить её "
+            "через календарь уже нельзя.",
+            ephemeral=True,
+        )
+        return
+    store.set_raid_schedule_exception(
+        origin,
+        "cancelled",
+        None,
+        (reason or "").strip(),
+        interaction.user.id,
+        utc_timestamp(),
+    )
+    reason_text = f" Причина: {(reason or '').strip()}" if (reason or "").strip() else ""
+    published = await publish_raid_schedule_change(
+        f"🚫 РТ **{parsed.strftime('%d.%m.%Y')} отменено**.{reason_text}"
+    )
+    await interaction_response(interaction).send_message(
+        f"🚫 РТ **{parsed.strftime('%d.%m.%Y')}** отменено. "
+        "Анонс, список отсутствующих и автоматический учёт запускаться не будут. "
+        + ("Участники уведомлены." if published else "Публичное уведомление отправить не удалось."),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="rt_move", description="Перенести конкретное РТ")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+@app_commands.describe(
+    raid_date="Исходная дата РТ в формате ДД.ММ.ГГГГ",
+    new_date="Новая дата РТ в формате ДД.ММ.ГГГГ",
+    reason="Причина переноса",
+)
+async def rt_move(
+    interaction: discord.Interaction,
+    raid_date: str,
+    new_date: str,
+    reason: Optional[str] = None,
+) -> None:
+    try:
+        old = parse_user_date(raid_date)
+        new = parse_user_date(new_date)
+    except ValueError as error:
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
+        return
+    origin = schedule_origin_for_input(old)
+    if old < datetime.now(MSK).date() or new < datetime.now(MSK).date():
+        await interaction_response(interaction).send_message(
+            "Нельзя переносить РТ в прошлое или изменять уже прошедшее РТ.",
+            ephemeral=True,
+        )
+        return
+    if old.weekday() not in (4, 6) and origin == old.isoformat():
+        await interaction_response(interaction).send_message(
+            "Исходная дата не является обычным или ранее перенесённым РТ.",
+            ephemeral=True,
+        )
+        return
+    if new == old:
+        await interaction_response(interaction).send_message(
+            "Новая дата совпадает с текущей.", ephemeral=True
+        )
+        return
+    if is_planned_raid_date(new) and schedule_origin_for_input(new) != origin:
+        await interaction_response(interaction).send_message(
+            "На новой дате уже запланировано другое РТ.", ephemeral=True
+        )
+        return
+    if store.raid_session_by_date(schedule_actual_date(origin)) is not None:
+        await interaction_response(interaction).send_message(
+            "Для исходной даты уже существует сессия посещаемости.", ephemeral=True
+        )
+        return
+    old_actual_date = schedule_actual_date(origin)
+    store.set_raid_schedule_exception(
+        origin,
+        "moved",
+        new.isoformat(),
+        (reason or "").strip(),
+        interaction.user.id,
+        utc_timestamp(),
+    )
+    store.move_raid_notices(old_actual_date, new.isoformat())
+    reason_text = f" Причина: {(reason or '').strip()}" if (reason or "").strip() else ""
+    published = await publish_raid_schedule_change(
+        f"🔁 РТ перенесено: **{old.strftime('%d.%m.%Y')} → "
+        f"{new.strftime('%d.%m.%Y')}**.{reason_text}"
+    )
+    await interaction_response(interaction).send_message(
+        f"🔁 РТ перенесено: **{old.strftime('%d.%m.%Y')} → "
+        f"{new.strftime('%d.%m.%Y')}**. На новой дате будут работать анонс, "
+        "отсутствия, посещаемость и отчёты. "
+        + ("Участники уведомлены." if published else "Публичное уведомление отправить не удалось."),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="rt_restore", description="Вернуть РТ в обычное расписание")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+@app_commands.describe(raid_date="Исходная или перенесённая дата РТ")
+async def rt_restore(interaction: discord.Interaction, raid_date: str) -> None:
+    try:
+        parsed = parse_user_date(raid_date)
+    except ValueError as error:
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
+        return
+    origin = schedule_origin_for_input(parsed)
+    exception = store.raid_schedule_exception(origin)
+    old_actual_date = schedule_actual_date(origin)
+    removed = store.remove_raid_schedule_exception(origin)
+    if removed:
+        if exception is not None and exception["action"] == "moved":
+            store.move_raid_notices(old_actual_date, origin)
+        original = parse_user_date(origin)
+        await publish_raid_schedule_change(
+            f"✅ Для РТ **{original.strftime('%d.%m.%Y')}** снова действует "
+            "обычное расписание."
+        )
+    await interaction_response(interaction).send_message(
+        "✅ Исключение удалено, действует обычное расписание РТ."
+        if removed
+        else "Для этой даты отмена или перенос не найдены.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="rt_schedule", description="Показать ближайшее расписание РТ")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
+async def rt_schedule(interaction: discord.Interaction) -> None:
+    today = datetime.now(MSK).date()
+    days = runtime_setting_int("raid_schedule_days")
+    end = today + timedelta(days=days)
+    exceptions = {
+        str(row["raid_date"]): row
+        for row in store.raid_schedule_exceptions(today.isoformat(), end.isoformat())
+    }
+    entries: list[tuple[object, str]] = []
+    rendered_origins: set[str] = set()
+    current = today
+    while current <= end:
+        if current.weekday() in (4, 6):
+            exception = exceptions.get(current.isoformat())
+            rendered_origins.add(current.isoformat())
+            if exception is None:
+                label = f"✅ **{current.strftime('%d.%m.%Y')}** — РТ"
+                if raid_announcements_paused(current):
+                    label += " · 🏖️ автоматический анонс отключён"
+                entries.append((current, label))
+            elif exception["action"] == "cancelled":
+                reason = f" · {exception['reason']}" if exception["reason"] else ""
+                entries.append(
+                    (current, f"🚫 **{current.strftime('%d.%m.%Y')}** — отменено{reason}")
+                )
+            else:
+                moved = parse_user_date(str(exception["replacement_date"]))
+                reason = f" · {exception['reason']}" if exception["reason"] else ""
+                entries.append(
+                    (
+                        moved,
+                        f"🔁 **{current.strftime('%d.%m.%Y')} → "
+                        f"{moved.strftime('%d.%m.%Y')}** — перенос{reason}",
+                    )
+                )
+        current += timedelta(days=1)
+    for origin, exception in exceptions.items():
+        if origin in rendered_origins or exception["action"] != "moved":
+            continue
+        moved = parse_user_date(str(exception["replacement_date"]))
+        if not today <= moved <= end:
+            continue
+        original = parse_user_date(origin)
+        reason = f" · {exception['reason']}" if exception["reason"] else ""
+        entries.append(
+            (
+                moved,
+                f"🔁 **{original.strftime('%d.%m.%Y')} → "
+                f"{moved.strftime('%d.%m.%Y')}** — перенос{reason}",
+            )
+        )
+    lines = [
+        f"📅 **Расписание РТ на {days} дней**",
+        f"Время: **{runtime_setting('raid_start_time')}–"
+        f"{runtime_setting('raid_end_time')} МСК**",
+    ]
+    lines.extend(text for _, text in sorted(entries, key=lambda item: item[0]))
+    await interaction_response(interaction).send_message(
+        "\n".join(lines[:25]), ephemeral=True
+    )
+
+
+SETTING_CHOICES = [
+    app_commands.Choice(name=spec.label, value=name)
+    for name, spec in SETTING_SPECS.items()
+]
+
+
+@bot.tree.command(name="settings_set", description="Изменить настройку бота без перезапуска")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+@app_commands.choices(setting=SETTING_CHOICES)
+@app_commands.describe(setting="Настройка", value="Новое значение")
+async def settings_set(
+    interaction: discord.Interaction,
+    setting: app_commands.Choice[str],
+    value: str,
+) -> None:
+    try:
+        normalized = parse_setting_value(setting.value, value)
+    except ValueError as error:
+        await interaction_response(interaction).send_message(str(error), ephemeral=True)
+        return
+    if SETTING_SPECS[setting.value].kind == "channel":
+        channel = interaction.guild.get_channel(int(normalized))
+        if channel is None or not hasattr(channel, "send"):
+            await interaction_response(interaction).send_message(
+                "Бот не видит этот текстовый канал.", ephemeral=True
+            )
+            return
+    store.set_state(f"setting:{setting.value}", normalized)
+    await interaction_response(interaction).send_message(
+        f"⚙️ **{SETTING_SPECS[setting.value].label}**: `{normalized}`. "
+        "Настройка уже применяется.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="settings_show", description="Показать изменяемые настройки бота")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+async def settings_show(interaction: discord.Interaction) -> None:
+    lines = ["⚙️ **Настройки бота**"]
+    for name, spec in SETTING_SPECS.items():
+        value = runtime_setting(name)
+        rendered = f"<#{value}>" if spec.kind == "channel" else f"`{value}`"
+        lines.append(f"• {spec.label}: {rendered}")
+    await interaction_response(interaction).send_message(
+        "\n".join(lines), ephemeral=True
+    )
+
+
+@bot.tree.command(name="settings_reset", description="Сбросить настройку бота")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+@app_commands.choices(setting=SETTING_CHOICES)
+async def settings_reset(
+    interaction: discord.Interaction,
+    setting: app_commands.Choice[str],
+) -> None:
+    store.delete_state(f"setting:{setting.value}")
+    await interaction_response(interaction).send_message(
+        f"Настройка **{SETTING_SPECS[setting.value].label}** сброшена: "
+        f"`{runtime_setting(setting.value)}`.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="tactics_status", description="Показать подтверждения последней тактики")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+async def tactics_status(interaction: discord.Interaction) -> None:
+    trackers = store.all_tactics_ack_messages()
+    if not trackers:
+        await interaction_response(interaction).send_message(
+            "Отслеживаемых публикаций с тактиками пока нет.", ephemeral=True
+        )
+        return
+    tracker = trackers[0]
+    source_message_id = int(tracker["source_message_id"])
+    jump_url = (
+        f"https://discord.com/channels/{config.GUILD_ID}/"
+        f"{tracker['channel_id']}/{source_message_id}"
+    )
+    await interaction_response(interaction).send_message(
+        tactics_ack_content(interaction.guild, source_message_id)
+        + f"\n[Открыть тактику]({jump_url})",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="weekly_report", description="Опубликовать недельную сводку РТ")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(OFFICER_COMMAND_ROLE_IDS, "Команда доступна только офицерам.")
+async def weekly_report(interaction: discord.Interaction) -> None:
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
+    start, end = previous_week_period()
+    if not store.weekly_raid_sessions(start.isoformat(), end.isoformat()):
+        await interaction.followup.send(
+            "За предыдущую неделю подтверждённых РТ нет.", ephemeral=True
+        )
+        return
+    channel = interaction.guild.get_channel(
+        runtime_setting_int("raid_analysis_channel")
+    )
+    if channel is None or not hasattr(channel, "send"):
+        await interaction.followup.send(
+            "Канал итогов РТ не найден.", ephemeral=True
+        )
+        return
+    await send_channel_chunks(
+        channel,
+        await weekly_raid_report_lines(interaction.guild, start, end),
+    )
+    store.set_state(
+        f"weekly_raid_report:{start.isoformat()}", datetime.now(MSK).isoformat()
+    )
+    await interaction.followup.send(
+        f"Недельная сводка опубликована в {channel.mention}.", ephemeral=True
     )
 
 
@@ -4089,6 +5579,107 @@ async def loot_member(
         lines.append(
             "Лут не найден. Проверьте привязку персонажей участника командой /links."
         )
+    await send_ephemeral_chunks(interaction, lines)
+
+
+@bot.tree.command(name="profile", description="Показать профиль участника статика")
+@app_commands.guilds(discord.Object(id=config.GUILD_ID))
+@app_commands.default_permissions()
+@has_command_role(
+    GUILD_MEMBER_COMMAND_ROLE_IDS,
+    "Команда доступна только участникам состава и Друзьям.",
+)
+@app_commands.describe(member="Участник; если не указан — ваш профиль")
+async def profile(
+    interaction: discord.Interaction,
+    member: Optional[discord.Member] = None,
+) -> None:
+    target = member or interaction.user
+    if not isinstance(target, discord.Member):
+        await interaction_response(interaction).send_message(
+            "Профиль доступен только на сервере.", ephemeral=True
+        )
+        return
+    await interaction_response(interaction).defer(ephemeral=True, thinking=True)
+    characters = store.linked_characters(target.id)
+    if not characters:
+        characters = list(config.DISCORD_CHARACTER_LINKS.get(target.id, []))
+    attendance_rows = store.member_attendance(target.id, limit=12)
+    credited = sum(
+        row["status"] in ("present", "late", "reserve")
+        for row in attendance_rows
+        if row["status"] != "excused"
+    )
+    eligible = sum(row["status"] != "excused" for row in attendance_rows)
+    percent = credited / eligible * 100 if eligible else 100.0
+    lines = [
+        f"👤 **Профиль: {target.display_name}**",
+        "Персонажи: " + (", ".join(characters) if characters else "не привязаны"),
+        f"Последние РТ: **{percent:.0f}% ({credited}/{eligible})**, "
+        f"опозданий — **{sum(row['status'] == 'late' for row in attendance_rows)}**, "
+        f"резерв — **{sum(row['status'] == 'reserve' for row in attendance_rows)}**, "
+        f"предупреждённых пропусков — "
+        f"**{sum(row['status'] == 'excused' for row in attendance_rows)}**.",
+    ]
+    if attendance_rows:
+        lines.append("**Последние отметки:**")
+        for row in attendance_rows[:6]:
+            label = ATTENDANCE_STATUS_LABELS.get(row["status"], row["status"])
+            lines.append(f"• {row['raid_date']} — {label}")
+    else:
+        lines.append("Подтверждённых РТ пока нет.")
+
+    if wowaudit.configured:
+        try:
+            season_name, items = await fetch_wowaudit_loot()
+            candidates = member_character_candidates(target)
+            member_items = [
+                item
+                for item in items
+                if not item.discarded
+                and normalize_character_name(item.recipient_name) in candidates
+            ][:5]
+            lines.append(f"**Последний лут — {season_name}:**")
+            lines.extend(
+                f"• {item.name} · {item.awarded_at}"
+                for item in member_items
+            )
+            if not member_items:
+                lines.append("• выданный лут не найден")
+        except WoWAuditAPIError:
+            lines.append("История лута временно недоступна.")
+
+    if attendance_rows and warcraftlogs.configured:
+        latest_date = datetime.strptime(
+            str(attendance_rows[0]["raid_date"]), "%Y-%m-%d"
+        ).replace(tzinfo=MSK)
+        try:
+            report = await warcraftlogs_report_for_date(latest_date)
+        except WarcraftLogsAPIError:
+            report = None
+        if report is not None:
+            candidates = member_character_candidates(target)
+            deaths = sum(
+                amount
+                for name, amount in report.deaths.items()
+                if normalize_character_name(name) in candidates
+            )
+            rankings = [
+                percent_value
+                for name, percent_value in WarcraftLogsClient.best_rankings(
+                    report.rankings, limit=100
+                )
+                if normalize_character_name(name) in candidates
+            ]
+            result = (
+                f", лучший результат — **{max(rankings):.1f}%**"
+                if rankings
+                else ""
+            )
+            lines.append(
+                f"**Последний Warcraft Logs ({latest_date.strftime('%d.%m.%Y')}):** "
+                f"учтённых смертей — **{deaths}**{result}."
+            )
     await send_ephemeral_chunks(interaction, lines)
 
 
@@ -4333,6 +5924,8 @@ async def bot_status(interaction: discord.Interaction) -> None:
             check_guest_roles,
             check_empty_channels,
             check_tactics_reminders,
+            check_feedback_surveys,
+            scheduled_weekly_raid_report,
             check_raid_loot_reports,
             check_warcraftlogs_reports,
             scheduled_raid_reminder,
@@ -4378,16 +5971,22 @@ async def bot_status(interaction: discord.Interaction) -> None:
                 f"Учтённые записи WoW Audit: {counts['wowaudit_loot_seen']}",
                 f"События/записи: "
                 f"{counts['events']}/{counts['event_participants']}",
-                f"Запущенные фоновые задачи: {loops_running}/15",
+                f"Запущенные фоновые задачи: {loops_running}/17",
                 f"Следующая синхронизация: {next_sync}",
                 "Автовыбор участника дня: ежедневно в 20:30 МСК",
-                "Объявление РТ: Пт/Вс в 20:30 МСК",
+                "Объявление РТ: Пт/Вс в "
+                + runtime_setting("raid_announcement_time")
+                + " МСК",
                 "Каникулы анонсов РТ: " + raid_vacation_status_text(),
                 "Последнее объявление РТ: "
                 + (store.get_state("last_reminder_date") or "нет"),
                 "Последний список отсутствующих перед РТ: "
                 + (store.get_state("last_absence_reminder_date") or "нет"),
-                "Учёт РТ: Пт/Вс, 21:00–00:00 МСК",
+                "Учёт РТ: Пт/Вс, "
+                + runtime_setting("raid_start_time")
+                + "–"
+                + runtime_setting("raid_end_time")
+                + " МСК",
                 f"Сброс статистики: {next_reset}",
                 f"Время работы процесса: {hours} ч. {minutes} мин.",
                 f"Задержка Discord: {round(bot.latency * 1000)} мс",
@@ -4556,6 +6155,11 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
     }
     before_ids = {role.id for role in before.roles}
     after_ids = {role.id for role in after.roles}
+    booster_status_changed = (
+        config.NITRO_BOOSTER_ROLE_ID in before_ids
+    ) != (
+        config.NITRO_BOOSTER_ROLE_ID in after_ids
+    )
     role_changes = [
         *[(role_id, "added") for role_id in after_ids - before_ids],
         *[(role_id, "removed") for role_id in before_ids - after_ids],
@@ -4590,6 +6194,9 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
             await after.send(config.MESSAGES["WELCOME_MESSAGE"])
         except (discord.Forbidden, discord.HTTPException):
             logger.info("Не удалось отправить личное сообщение %s", after)
+        await publish_sergeant_checklist(after)
+    if booster_status_changed:
+        await refresh_supporters_message(after.guild)
 
 
 async def main() -> None:

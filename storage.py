@@ -162,6 +162,55 @@ class StateStore:
                     PRIMARY KEY (event_id, member_id),
                     FOREIGN KEY (event_id) REFERENCES guild_events(id)
                 );
+                CREATE TABLE IF NOT EXISTS raid_schedule_exceptions (
+                    raid_date TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    replacement_date TEXT,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_by INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    CHECK (action IN ('cancelled', 'moved'))
+                );
+                CREATE TABLE IF NOT EXISTS tactics_acknowledgements (
+                    source_message_id INTEGER NOT NULL,
+                    member_id INTEGER NOT NULL,
+                    acknowledged_at REAL NOT NULL,
+                    PRIMARY KEY (source_message_id, member_id)
+                );
+                CREATE TABLE IF NOT EXISTS tactics_ack_messages (
+                    source_message_id INTEGER PRIMARY KEY,
+                    acknowledgement_message_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS raid_feedback_messages (
+                    session_id INTEGER PRIMARY KEY,
+                    message_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    FOREIGN KEY (session_id) REFERENCES raid_sessions(id)
+                );
+                CREATE TABLE IF NOT EXISTS raid_feedback (
+                    session_id INTEGER NOT NULL,
+                    member_id INTEGER NOT NULL,
+                    organization INTEGER NOT NULL,
+                    pace INTEGER NOT NULL,
+                    atmosphere INTEGER NOT NULL,
+                    comment TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, member_id),
+                    FOREIGN KEY (session_id) REFERENCES raid_sessions(id)
+                );
+                CREATE TABLE IF NOT EXISTS sergeant_checklists (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    member_id INTEGER NOT NULL,
+                    message_id INTEGER UNIQUE,
+                    completed_mask INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                );
                 """
             )
             # Старые версии разрешали привязать одного персонажа нескольким
@@ -267,6 +316,80 @@ class StateStore:
     def clear_stats(self) -> None:
         with self._lock, self._connection:
             self._connection.execute("DELETE FROM pidor_stats")
+
+    def create_sergeant_checklist(self, member_id: int, created_at: float) -> int:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE sergeant_checklists
+                SET status='closed', updated_at=?
+                WHERE member_id=? AND status='active'
+                """,
+                (created_at, member_id),
+            )
+            cursor = self._connection.execute(
+                """
+                INSERT INTO sergeant_checklists(
+                    member_id, created_at, updated_at
+                ) VALUES (?, ?, ?)
+                """,
+                (member_id, created_at, created_at),
+            )
+            return int(cursor.lastrowid)
+
+    def set_sergeant_checklist_message(
+        self, checklist_id: int, message_id: int, updated_at: float
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE sergeant_checklists
+                SET message_id=?, updated_at=?
+                WHERE id=?
+                """,
+                (message_id, updated_at, checklist_id),
+            )
+
+    def sergeant_checklist(self, checklist_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection.execute(
+                "SELECT * FROM sergeant_checklists WHERE id=?",
+                (checklist_id,),
+            ).fetchone()
+
+    def active_sergeant_checklists(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT * FROM sergeant_checklists
+                WHERE status='active' AND message_id IS NOT NULL
+                ORDER BY id
+                """
+            ).fetchall()
+
+    def set_sergeant_checklist_mask(
+        self, checklist_id: int, completed_mask: int, updated_at: float
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE sergeant_checklists
+                SET completed_mask=?, updated_at=?
+                WHERE id=? AND status='active'
+                """,
+                (completed_mask, updated_at, checklist_id),
+            )
+
+    def close_sergeant_checklist(self, checklist_id: int, updated_at: float) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE sergeant_checklists
+                SET status='closed', updated_at=?
+                WHERE id=?
+                """,
+                (updated_at, checklist_id),
+            )
 
     def get_state(self, key: str) -> str | None:
         with self._lock:
@@ -543,6 +666,130 @@ class StateStore:
                 FROM raid_sessions ORDER BY id DESC LIMIT 1
                 """
             ).fetchone()
+
+    def set_raid_schedule_exception(
+        self,
+        raid_date: str,
+        action: str,
+        replacement_date: str | None,
+        reason: str,
+        created_by: int,
+        created_at: float,
+    ) -> None:
+        if action not in ("cancelled", "moved"):
+            raise ValueError("Некорректное действие календаря РТ")
+        if action == "moved" and not replacement_date:
+            raise ValueError("Для переноса нужна новая дата")
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO raid_schedule_exceptions(
+                    raid_date, action, replacement_date, reason,
+                    created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(raid_date) DO UPDATE SET
+                    action=excluded.action,
+                    replacement_date=excluded.replacement_date,
+                    reason=excluded.reason,
+                    created_by=excluded.created_by,
+                    created_at=excluded.created_at
+                """,
+                (
+                    raid_date,
+                    action,
+                    replacement_date,
+                    reason,
+                    created_by,
+                    created_at,
+                ),
+            )
+
+    def raid_schedule_exception(self, raid_date: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT raid_date, action, replacement_date, reason,
+                       created_by, created_at
+                FROM raid_schedule_exceptions WHERE raid_date=?
+                """,
+                (raid_date,),
+            ).fetchone()
+
+    def raid_move_to_date(self, replacement_date: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT raid_date, action, replacement_date, reason,
+                       created_by, created_at
+                FROM raid_schedule_exceptions
+                WHERE action='moved' AND replacement_date=?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (replacement_date,),
+            ).fetchone()
+
+    def raid_schedule_exceptions(
+        self, start_date: str, end_date: str
+    ) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT raid_date, action, replacement_date, reason,
+                       created_by, created_at
+                FROM raid_schedule_exceptions
+                WHERE raid_date BETWEEN ? AND ?
+                   OR replacement_date BETWEEN ? AND ?
+                ORDER BY raid_date
+                """,
+                (start_date, end_date, start_date, end_date),
+            ).fetchall()
+
+    def remove_raid_schedule_exception(self, raid_date: str) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM raid_schedule_exceptions WHERE raid_date=?",
+                (raid_date,),
+            )
+        return bool(cursor.rowcount)
+
+    def move_raid_notices(self, old_date: str, new_date: str) -> None:
+        if old_date == new_date:
+            return
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT member_id, reason, created_at FROM raid_absences
+                WHERE raid_date=?
+                """,
+                (old_date,),
+            ).fetchall()
+            for row in rows:
+                self._connection.execute(
+                    """
+                    INSERT INTO raid_absences(
+                        raid_date, member_id, reason, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(raid_date, member_id) DO UPDATE SET
+                        reason=excluded.reason,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        new_date,
+                        row["member_id"],
+                        row["reason"],
+                        row["created_at"],
+                    ),
+                )
+            self._connection.execute(
+                "DELETE FROM raid_absences WHERE raid_date=?", (old_date,)
+            )
+            self._connection.execute(
+                """
+                UPDATE raid_notice_messages SET raid_date=?
+                WHERE raid_date=?
+                """,
+                (new_date, old_date),
+            )
 
     def ensure_attendance_member(self, session_id: int, member_id: int) -> None:
         with self._lock, self._connection:
@@ -1124,6 +1371,296 @@ class StateStore:
                 (f"{month}%",),
             ).fetchall()
 
+    def member_attendance(
+        self, member_id: int, limit: int = 12
+    ) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT ar.member_id, ar.status, ar.present_seconds,
+                       rs.raid_date, ar.note
+                FROM attendance_records ar
+                JOIN raid_sessions rs ON rs.id=ar.session_id
+                WHERE rs.status='confirmed' AND ar.member_id=?
+                ORDER BY rs.raid_date DESC LIMIT ?
+                """,
+                (member_id, limit),
+            ).fetchall()
+
+    def frequent_late_members(
+        self, minimum_lates: int, recent_raids: int
+    ) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                WITH recent AS (
+                    SELECT id, raid_date FROM raid_sessions
+                    WHERE status='confirmed'
+                    ORDER BY raid_date DESC LIMIT ?
+                )
+                SELECT ar.member_id,
+                       SUM(CASE WHEN ar.status='late' THEN 1 ELSE 0 END) AS lates,
+                       COUNT(*) AS raids,
+                       MAX(recent.raid_date) AS latest_raid_date
+                FROM attendance_records ar
+                JOIN recent ON recent.id=ar.session_id
+                GROUP BY ar.member_id
+                HAVING lates >= ?
+                ORDER BY lates DESC, ar.member_id
+                """,
+                (recent_raids, minimum_lates),
+            ).fetchall()
+
+    def weekly_raid_sessions(
+        self, start_date: str, end_date: str
+    ) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT rs.id, rs.raid_date, rs.started_at, rs.ended_at,
+                       rs.status, wlr.report_code
+                FROM raid_sessions rs
+                LEFT JOIN warcraftlogs_reports wlr ON wlr.session_id=rs.id
+                WHERE rs.status='confirmed'
+                  AND rs.raid_date BETWEEN ? AND ?
+                ORDER BY rs.raid_date
+                """,
+                (start_date, end_date),
+            ).fetchall()
+
+    def attendance_between(
+        self, start_date: str, end_date: str
+    ) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT ar.member_id, ar.status, ar.present_seconds,
+                       rs.raid_date, ar.note
+                FROM attendance_records ar
+                JOIN raid_sessions rs ON rs.id=ar.session_id
+                WHERE rs.status='confirmed'
+                  AND rs.raid_date BETWEEN ? AND ?
+                ORDER BY rs.raid_date, ar.member_id
+                """,
+                (start_date, end_date),
+            ).fetchall()
+
+    def save_tactics_ack_message(
+        self,
+        source_message_id: int,
+        acknowledgement_message_id: int,
+        channel_id: int,
+        created_at: float,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO tactics_ack_messages(
+                    source_message_id, acknowledgement_message_id,
+                    channel_id, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_message_id) DO UPDATE SET
+                    acknowledgement_message_id=excluded.acknowledgement_message_id,
+                    channel_id=excluded.channel_id,
+                    created_at=excluded.created_at
+                """,
+                (
+                    source_message_id,
+                    acknowledgement_message_id,
+                    channel_id,
+                    created_at,
+                ),
+            )
+
+    def tactics_ack_message(self, source_message_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT source_message_id, acknowledgement_message_id,
+                       channel_id, created_at
+                FROM tactics_ack_messages WHERE source_message_id=?
+                """,
+                (source_message_id,),
+            ).fetchone()
+
+    def all_tactics_ack_messages(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT source_message_id, acknowledgement_message_id,
+                       channel_id, created_at
+                FROM tactics_ack_messages ORDER BY created_at DESC
+                """
+            ).fetchall()
+
+    def acknowledge_tactics(
+        self, source_message_id: int, member_id: int, acknowledged_at: float
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO tactics_acknowledgements(
+                    source_message_id, member_id, acknowledged_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(source_message_id, member_id) DO UPDATE SET
+                    acknowledged_at=excluded.acknowledged_at
+                """,
+                (source_message_id, member_id, acknowledged_at),
+            )
+
+    def tactics_acknowledged_members(self, source_message_id: int) -> set[int]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT member_id FROM tactics_acknowledgements
+                WHERE source_message_id=?
+                """,
+                (source_message_id,),
+            ).fetchall()
+        return {int(row["member_id"]) for row in rows}
+
+    def remove_tactics_ack_tracker(self, source_message_id: int) -> sqlite3.Row | None:
+        with self._lock, self._connection:
+            row = self.tactics_ack_message(source_message_id)
+            self._connection.execute(
+                "DELETE FROM tactics_acknowledgements WHERE source_message_id=?",
+                (source_message_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM tactics_ack_messages WHERE source_message_id=?",
+                (source_message_id,),
+            )
+        return row
+
+    def save_feedback_message(
+        self,
+        session_id: int,
+        message_id: int,
+        channel_id: int,
+        created_at: float,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO raid_feedback_messages(
+                    session_id, message_id, channel_id, created_at, status
+                ) VALUES (?, ?, ?, ?, 'open')
+                ON CONFLICT(session_id) DO UPDATE SET
+                    message_id=excluded.message_id,
+                    channel_id=excluded.channel_id,
+                    created_at=excluded.created_at,
+                    status='open'
+                """,
+                (session_id, message_id, channel_id, created_at),
+            )
+
+    def feedback_message(self, session_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT session_id, message_id, channel_id, created_at, status
+                FROM raid_feedback_messages WHERE session_id=?
+                """,
+                (session_id,),
+            ).fetchone()
+
+    def open_feedback_messages(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT session_id, message_id, channel_id, created_at, status
+                FROM raid_feedback_messages WHERE status='open'
+                ORDER BY created_at
+                """
+            ).fetchall()
+
+    def finished_sessions_missing_feedback(
+        self, ended_after: float
+    ) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT rs.id, rs.raid_date, rs.ended_at
+                FROM raid_sessions rs
+                LEFT JOIN raid_feedback_messages rfm ON rfm.session_id=rs.id
+                WHERE rs.status IN ('draft', 'confirmed')
+                  AND rs.ended_at>=?
+                  AND rfm.session_id IS NULL
+                ORDER BY rs.ended_at DESC LIMIT 1
+                """,
+                (ended_after,),
+            ).fetchall()
+
+    def save_raid_feedback(
+        self,
+        session_id: int,
+        member_id: int,
+        organization: int,
+        pace: int,
+        atmosphere: int,
+        comment: str,
+        created_at: float,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO raid_feedback(
+                    session_id, member_id, organization, pace,
+                    atmosphere, comment, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, member_id) DO UPDATE SET
+                    organization=excluded.organization,
+                    pace=excluded.pace,
+                    atmosphere=excluded.atmosphere,
+                    comment=excluded.comment,
+                    created_at=excluded.created_at
+                """,
+                (
+                    session_id,
+                    member_id,
+                    organization,
+                    pace,
+                    atmosphere,
+                    comment,
+                    created_at,
+                ),
+            )
+
+    def raid_feedback_summary(self, session_id: int) -> sqlite3.Row:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT COUNT(*) AS responses,
+                       AVG(organization) AS organization,
+                       AVG(pace) AS pace,
+                       AVG(atmosphere) AS atmosphere
+                FROM raid_feedback WHERE session_id=?
+                """,
+                (session_id,),
+            ).fetchone()
+
+    def raid_feedback_comments(self, session_id: int) -> list[str]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT comment FROM raid_feedback
+                WHERE session_id=? AND comment<>''
+                ORDER BY created_at
+                """,
+                (session_id,),
+            ).fetchall()
+        return [str(row["comment"]) for row in rows]
+
+    def close_feedback_message(self, session_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE raid_feedback_messages SET status='closed'
+                WHERE session_id=?
+                """,
+                (session_id,),
+            )
+
     def add_role_history(
         self,
         occurred_at: float,
@@ -1301,6 +1838,7 @@ class StateStore:
             "warcraftlogs_reports": "warcraftlogs_reports",
             "events": "guild_events",
             "event_participants": "guild_event_participants",
+            "sergeant_checklists": "sergeant_checklists",
         }
         result: dict[str, int] = {}
         with self._lock:

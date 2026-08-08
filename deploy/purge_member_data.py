@@ -67,7 +67,10 @@ def purge_database(
             "raid_notice_messages": "member_id",
             "temp_channels": "owner_id",
             "tactics_reminders": "author_id",
+            "tactics_acknowledgements": "member_id",
+            "raid_feedback": "member_id",
             "guild_event_participants": "member_id",
+            "sergeant_checklists": "member_id",
         }
         for table, column in member_tables.items():
             deleted += delete_where(
@@ -81,6 +84,16 @@ def purge_database(
                 "member_id=? OR actor_id=?",
                 (member_id, member_id),
             )
+
+        if table_exists(connection, "raid_schedule_exceptions"):
+            cursor = connection.execute(
+                """
+                UPDATE raid_schedule_exceptions SET created_by=0
+                WHERE created_by=?
+                """,
+                (member_id,),
+            )
+            deleted += max(cursor.rowcount, 0)
 
         if table_exists(connection, "guild_events"):
             event_rows = connection.execute(
